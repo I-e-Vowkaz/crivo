@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["projects", "findings"],
+  "properties": {
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project", "status", "conflicts"],
+        "properties": {
+          "project": { "type": "string", "enum": ["back", "front"] },
+          "status": { "type": "string", "enum": ["ok", "sem_card", "sem_alteracoes", "erro"] },
+          "conflicts": { "type": "array", "items": { "type": "string" } },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project", "kind", "severity", "severity_reason", "impact", "file", "line", "title", "description", "steps", "confidence", "markdown"],
+        "properties": {
+          "project": { "type": "string", "enum": ["back", "front"] },
+          "kind": { "type": "string", "enum": ["bug", "padrao", "requisito"] },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "severity_reason": { "type": "string" },
+          "impact": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "pattern_ref": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["confirmed", "plausible"] },
+          "markdown": { "type": "string" }
+        }
+      }
+    }
+  }
+}

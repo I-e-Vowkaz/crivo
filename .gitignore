@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.log
+src-tauri/target/
+src-tauri/gen/
+target/
+spikes/results/
+__pycache__/
+*.env
+.env*
+.idea/
+.vscode/*
+!.vscode/extensions.json

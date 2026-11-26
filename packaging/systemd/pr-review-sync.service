@@ -1,0 +1,10 @@
+[Unit]
+Description=PR Review Orchestrator: atualizar a lista de PRs do Bitbucket
+# precisa da sessão do usuário (cofre de senhas via D-Bus) e de rede
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pr-review-orchestrator --sync
+# só leitura no Bitbucket; o resultado vai para o banco do app
+TimeoutStartSec=5min

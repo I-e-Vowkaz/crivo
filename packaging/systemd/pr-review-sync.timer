@@ -1,0 +1,11 @@
+[Unit]
+Description=PR Review Orchestrator: atualizar PRs todo dia às 10h
+
+[Timer]
+OnCalendar=*-*-* 10:00:00
+# se o PC estava desligado às 10h, roda assim que você logar
+Persistent=true
+Unit=pr-review-sync.service
+
+[Install]
+WantedBy=timers.target

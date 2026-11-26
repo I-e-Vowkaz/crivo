@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["improvements"],
+  "properties": {
+    "improvements": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "file", "line", "end_line", "title", "description", "evidence", "existing_code", "improved_code"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["redundante", "codigo_morto", "simplificavel", "duplicado", "abstracao_desnecessaria", "desempenho", "teste"]
+          },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "end_line": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "evidence": { "type": "string" },
+          "existing_code": { "type": "string" },
+          "improved_code": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["judgments"],
+  "properties": {
+    "judgments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "score", "equivalent", "why"],
+        "properties": {
+          "id": { "type": "string" },
+          "score": { "type": "integer", "minimum": 0, "maximum": 10 },
+          "equivalent": { "type": "boolean" },
+          "why": { "type": "string" }
+        }
+      }
+    }
+  }
+}
