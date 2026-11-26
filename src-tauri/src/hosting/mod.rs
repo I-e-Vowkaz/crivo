@@ -53,7 +53,23 @@ pub struct RepoRef {
 impl RepoRef {
     pub fn new(provider: &str, owner: impl Into<String>, slug: impl Into<String>) -> AppResult<RepoRef> {
         let kind = Kind::parse(provider).ok_or_else(|| AppError::Invalid(format!("provedor desconhecido: {provider}")))?;
-        Ok(RepoRef { kind, owner: owner.into(), slug: slug.into() })
+        let (owner, slug) = (owner.into(), slug.into());
+        // viram pedaços de caminho (clone em `<root>/<owner>/<slug>`): um componente só
+        let single = |s: &str| {
+            let mut c = Path::new(s).components();
+            matches!((c.next(), c.next()), (Some(std::path::Component::Normal(_)), None)) && !s.starts_with('.')
+        };
+        if !single(&owner) || !single(&slug) {
+            return Err(AppError::Invalid(format!("repositório inválido: {owner}/{slug}")));
+        }
+        Ok(RepoRef { kind, owner, slug })
+    }
+
+    /// Para os `query_map`: as colunas `repositories.provider`, `workspace` e `slug`.
+    pub fn from_row(provider: &str, owner: String, slug: String) -> rusqlite::Result<RepoRef> {
+        RepoRef::new(provider, owner, slug).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e.to_string())))
+        })
     }
 
     /// Clone local: `<root>/<slug>`; no GitHub, `<root>/<owner>/<slug>` quando existe.
@@ -103,6 +119,16 @@ impl RepoRef {
             Kind::Github => git::checkout_github(repo, number).await,
         }
     }
+}
+
+/// Quem eu sou no provedor, gravado no último sync: o `uuid` no Bitbucket e o `login` no GitHub
+/// (é o que vai em `reviewers_json[].uuid`).
+pub fn me(conn: &rusqlite::Connection, kind: Kind) -> AppResult<Option<String>> {
+    let (key, field) = match kind {
+        Kind::Bitbucket => ("bitbucket.me", "uuid"),
+        Kind::Github => ("github.me", "login"),
+    };
+    Ok(crate::db::get_setting(conn, key)?.and_then(|v| v.get(field).and_then(serde_json::Value::as_str).map(str::to_owned)))
 }
 
 /// Resultado do sync de um repositório.
@@ -186,6 +212,24 @@ mod tests {
         assert_eq!(gh.clone_path(&root), root.join("acme/app"));
         assert_eq!(bb.clone_path(&root), root.join("app"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn nome_que_sai_da_pasta_e_erro() {
+        for (owner, slug) in [("acme", "../x"), ("acme", "a/b"), ("..", "app"), ("acme", ".git"), ("", "app"), ("acme", "")] {
+            assert!(RepoRef::new("github", owner, slug).is_err(), "{owner}/{slug}");
+        }
+        assert!(RepoRef::new("bitbucket", "acme", "acme-back").is_ok());
+    }
+
+    #[test]
+    fn minha_identidade_por_provedor() {
+        let conn = crate::db::open_in_memory().unwrap();
+        assert_eq!(me(&conn, Kind::Github).unwrap(), None);
+        crate::db::set_setting(&conn, "bitbucket.me", &serde_json::json!({"uuid": "{u1}", "display_name": "Eu"})).unwrap();
+        crate::db::set_setting(&conn, "github.me", &serde_json::json!({"login": "eu", "id": 7})).unwrap();
+        assert_eq!(me(&conn, Kind::Bitbucket).unwrap().as_deref(), Some("{u1}"));
+        assert_eq!(me(&conn, Kind::Github).unwrap().as_deref(), Some("eu"));
     }
 
     #[test]

@@ -393,10 +393,10 @@ pub fn list_prs(state: State<'_, AppState>) -> AppResult<PrList> {
 
 /// As listas do app ("Para eu revisar" e "Meus PRs"), também usadas pelo `prs` do terminal.
 pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
-    let me: Option<String> = db::get_setting(&conn, "bitbucket.me")?
-        .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned));
-    let github_me: Option<String> = db::get_setting(&conn, "github.me")?
-        .and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned));
+    let ids = [hosting::Kind::Bitbucket, hosting::Kind::Github]
+        .into_iter()
+        .map(|k| Ok((k, hosting::me(conn, k)?)))
+        .collect::<AppResult<std::collections::HashMap<_, _>>>()?;
     let mut stmt = conn.prepare(
         "SELECT p.id, r.slug, p.bb_id, p.title, p.url, p.author_name, p.category, p.changes_requested,
                 p.changed_since_sync, p.reviewers_json, p.source_branch, p.dest_branch, p.updated_on,
@@ -429,9 +429,8 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
         .query_map([], |r| {
             let reviewers: Vec<bitbucket::sync::Reviewer> =
                 serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
-            let provider: String = r.get(26)?;
-            let identity = if provider == "github" { &github_me } else { &me };
-            let approved_by_me = identity.as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
+            let rr = hosting::RepoRef::from_row(&r.get::<_, String>(26)?, r.get(27)?, r.get(1)?)?;
+            let approved_by_me = ids[&rr.kind].as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
             let run_id: Option<String> = r.get(13)?;
             let reviewed: Option<String> = r.get(21)?;
             let current: String = r.get(22)?;
@@ -439,8 +438,8 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
             Ok(PrView {
                 id: r.get(0)?,
                 repo: r.get(1)?,
-                provider,
-                owner: r.get(27)?,
+                provider: rr.kind.as_str().to_owned(),
+                owner: rr.owner,
                 bb_id: r.get(2)?,
                 title: r.get(3)?,
                 url: r.get(4)?,
@@ -745,26 +744,22 @@ pub struct CheckoutResult {
 /// Recusa se houver alteração não commitada ou se a branch local divergiu.
 #[tauri::command]
 pub async fn checkout_pr(state: State<'_, AppState>, pr_id: i64) -> AppResult<CheckoutResult> {
-    let (slug, mut branch, sha, root, provider, number, owner) = {
+    let (rr, branch, sha, number, root) = {
         let conn = state.conn()?;
-        let (slug, branch, sha, provider, number, owner): (String, String, String, String, i64, String) = conn.query_row(
-            "SELECT r.slug, p.source_branch, p.source_sha, r.provider, p.bb_id, r.workspace FROM pull_requests p
+        let (rr, branch, sha, number): (hosting::RepoRef, String, String, i64) = conn.query_row(
+            "SELECT r.provider, r.workspace, r.slug, p.source_branch, p.source_sha, p.bb_id FROM pull_requests p
              JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
             [pr_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((hosting::RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-        (slug, branch, sha, review::repos_root(&conn)?, provider, number, owner)
+        (rr, branch, sha, number, review::repos_root(&conn)?)
     };
-    let repo = if provider == "github" { github::clone_path(&root, &owner, &slug) } else { root.join(&slug) };
+    let repo = rr.clone_path(&root);
     if !repo.join(".git").exists() {
-        return Err(AppError::Invalid(format!("não achei o clone de {slug} em {}", repo.display())));
+        return Err(AppError::Invalid(format!("não achei o clone de {} em {}", rr.slug, repo.display())));
     }
-    let head = if provider == "github" {
-        let (local, head) = review::git::checkout_github(&repo, number).await?;
-        branch = local;
-        head
-    } else { review::git::checkout_synced(&repo, &slug, &branch).await? };
-    Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: slug, branch, head })
+    let (branch, head) = rr.checkout(&repo, number, &branch).await?;
+    Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: rr.slug, branch, head })
 }
 
 // ---------------- Chat sobre o review ----------------

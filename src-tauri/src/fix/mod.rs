@@ -97,8 +97,8 @@ fn run_dir_of(host: &Host, fix_id: &str) -> PathBuf {
 #[derive(Clone)]
 struct Target {
     kind: &'static str,
-    provider: String,
-    owner: String,
+    /// Repositório do PR no provedor; `None` na branch local.
+    repo: Option<crate::hosting::RepoRef>,
     source_repo: String,
     pr_id: Option<i64>,
     slug: String,
@@ -226,8 +226,7 @@ fn load_pr_target(conn: &Connection, pr_id: i64) -> AppResult<(Target, String)> 
             Ok((
                 Target {
                     kind: "pr",
-                    provider: r.get(6)?,
-                    owner: r.get(7)?,
+                    repo: Some(crate::hosting::RepoRef::from_row(&r.get::<_, String>(6)?, r.get(7)?, r.get(0)?)?),
                     source_repo: r.get(8)?,
                     pr_id: Some(pr_id),
                     slug: r.get(0)?,
@@ -251,8 +250,7 @@ fn target_of(conn: &Connection, s: &SessionRow) -> AppResult<Target> {
             let branch = s.branch.clone().unwrap_or_default();
             Ok(Target {
                 kind: "branch",
-                provider: "local".into(),
-                owner: String::new(),
+                repo: None,
                 source_repo: String::new(),
                 pr_id: None,
                 slug: s.repo_slug.clone().unwrap_or_default(),
@@ -277,10 +275,14 @@ fn repo_of(conn: &Connection, slug: &str) -> AppResult<PathBuf> {
 }
 
 fn repo_of_target(conn: &Connection, t: &Target) -> AppResult<PathBuf> {
-    if t.provider != "github" { return repo_of(conn, &t.slug); }
-    let repo = crate::github::clone_path(&review::repos_root(conn)?, &t.owner, &t.slug);
+    let Some(rr) = &t.repo else { return repo_of(conn, &t.slug) };
+    let repo = rr.clone_path(&review::repos_root(conn)?);
     if !repo.join(".git").exists() {
-        return Err(AppError::Invalid(format!("clone GitHub {}/{} não encontrado em {}", t.owner, t.slug, repo.display())));
+        return Err(AppError::Invalid(format!(
+            "não achei o clone local de {} em {} (ajuste a pasta dos repositórios nas Configurações)",
+            rr.slug,
+            repo.display()
+        )));
     }
     Ok(repo)
 }
@@ -842,8 +844,8 @@ async fn client(host: &Host) -> AppResult<(Client, String, String)> {
 /// escolhe quais o Claude analisa).
 async fn prepare_pr(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc<RunCtl>) -> AppResult<()> {
     set_stage(host, fix_id, t, "buscando o código da branch (git fetch)");
-    let (src, _) = if t.provider == "github" { review::github_tips(repo, t.bb_id, &t.base).await? }
-        else { review::fresh_tips(repo, &t.branch, &t.base).await? };
+    let rr = t.repo.as_ref().ok_or_else(|| AppError::Invalid("correção de PR sem repositório".into()))?;
+    let (src, _) = rr.fetch_tips(repo, t.bb_id, &t.branch, &t.base).await?;
     let s = with_db(host, |c| load_session(c, fix_id))?;
     git::run(repo, &["worktree", "add", "--detach", &s.wt().display().to_string(), &src]).await?;
     with_db(host, |c| Ok(c.execute("UPDATE fix_sessions SET base_sha = ?1 WHERE id = ?2", params![src, fix_id])?))?;
@@ -858,7 +860,7 @@ async fn prepare_pr(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc
 /// Threads abertas do PR que ainda não estão na correção → itens 'new'. Devolve quantas entraram.
 async fn add_threads(host: &Host, fix_id: &str, t: &Target, ctl: &RunCtl) -> AppResult<usize> {
     set_stage(host, fix_id, t, "buscando os comentários da PR");
-    let threads = if t.provider == "github" {
+    let threads = if let Some(rr) = t.repo.as_ref().filter(|r| r.kind == crate::hosting::Kind::Github) {
         let (mode, me) = with_db(host, |c| {
             let mode = crate::db::get_setting(c, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into());
             let me = crate::db::get_setting(c, "github.me")?.and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned))
@@ -867,7 +869,7 @@ async fn add_threads(host: &Host, fix_id: &str, t: &Target, ctl: &RunCtl) -> App
         })?;
         let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
         let api = crate::github::Api::new(token)?;
-        crate::github::open_threads(&api, &t.owner, &t.slug, t.bb_id, &me).await?
+        crate::github::open_threads(&api, &rr.owner, &rr.slug, t.bb_id, &me).await?
     } else {
         let (client, ws, me) = client(host).await?;
         comments::open_threads(&client, &ws, &t.slug, t.bb_id, &me).await?
@@ -975,7 +977,7 @@ pub async fn add_findings(host: Host, run_id: String, seqs: Vec<i64>) -> AppResu
         let latest = latest_branch_id(&conn, &slug, &branch)?;
         (slug, branch, base.unwrap_or_else(|| "dev".into()), repo, latest)
     };
-    let t = Target { kind: "branch", provider: "local".into(), owner: String::new(), source_repo: String::new(), pr_id: None, slug, bb_id: 0, title: branch.clone(), branch: branch.clone(), base };
+    let t = Target { kind: "branch", repo: None, source_repo: String::new(), pr_id: None, slug, bb_id: 0, title: branch.clone(), branch: branch.clone(), base };
     let tip = git::run(&repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}^{{commit}}")])
         .await
         .map_err(|_| AppError::Invalid(format!("a branch {branch} não existe mais no clone")))?;
@@ -1751,7 +1753,7 @@ async fn commit_and_finish(
     check(&ctl)?;
     if t.kind == "pr" {
         set_stage(host, fix_id, t, &format!("push para {}", t.branch));
-        let pushed = if t.provider == "github" {
+        let pushed = if t.repo.as_ref().is_some_and(|r| r.kind == crate::hosting::Kind::Github) {
             let mode = with_db(host, |c| Ok(crate::db::get_setting(c, "github.auth_mode")?
                 .and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())))?;
             let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
