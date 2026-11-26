@@ -65,10 +65,7 @@ pub fn target(conn: &Connection, run_id: &str, view: View) -> AppResult<Target> 
                 [id],
                 |r| Ok((crate::hosting::RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
-            let repo = rr.clone_path(&root);
-            if !repo.join(".git").exists() {
-                return Err(AppError::Invalid(format!("{} não é um clone git", repo.display())));
-            }
+            let repo = rr.clone_dir(&root)?;
             (repo, format!("origin/{dst}"), rr.head_ref(number, &src))
         }
         None => {
@@ -477,7 +474,8 @@ index 1111111..2222222 100644
         let root = std::env::temp_dir().join(format!("prr-dview-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let (origin, author, user) = (root.join("o.git"), root.join("a"), root.join("r"));
+        // o origin termina em `w/r`, o repositório do banco: o app confere isso antes de usar o clone
+        let (origin, author, user) = (root.join("w").join("r.git"), root.join("a"), root.join("r"));
         g(&root, &["init", "-q", "--bare", origin.to_str().unwrap()]);
         g(&root, &["clone", "-q", origin.to_str().unwrap(), author.to_str().unwrap()]);
         std::fs::write(author.join("f.txt"), "1\n").unwrap();

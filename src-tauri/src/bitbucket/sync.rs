@@ -172,11 +172,11 @@ fn reviewers_of(pr: &BbPr) -> Vec<Reviewer> {
 pub fn upsert_repo_prs(conn: &mut Connection, ws: &str, slug: &str, prs: &[(BbPr, &str)]) -> AppResult<usize> {
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO repositories (workspace, slug) VALUES (?1, ?2) ON CONFLICT (provider, workspace, slug) DO NOTHING",
+        "INSERT INTO repositories (provider, workspace, slug) VALUES ('bitbucket', ?1, ?2) ON CONFLICT (provider, workspace, slug) DO NOTHING",
         params![ws, slug],
     )?;
     let repo_id: i64 =
-        tx.query_row("SELECT id FROM repositories WHERE workspace = ?1 AND slug = ?2", params![ws, slug], |r| r.get(0))?;
+        tx.query_row("SELECT id FROM repositories WHERE provider = 'bitbucket' AND workspace = ?1 AND slug = ?2", params![ws, slug], |r| r.get(0))?;
 
     let mut seen = Vec::new();
     for (pr, cat) in prs {
@@ -285,6 +285,18 @@ mod tests {
         let reqs = srv.requests.lock().unwrap();
         assert!(reqs[0].contains("q=state%3D%22OPEN%22+AND+reviewers.uuid"), "{}", reqs[0]);
         assert!(reqs[1].contains("page=2"), "{}", reqs[1]);
+    }
+
+    #[test]
+    fn nao_grava_no_repositorio_do_github_de_mesmo_nome() {
+        let mut conn = db::open_in_memory().unwrap();
+        conn.execute("INSERT INTO repositories (id, provider, workspace, slug) VALUES (1, 'github', 'ws', 'r')", []).unwrap();
+        let pr = serde_json::from_str::<BbPr>(&pr_json(1, "{a}", "s1", "")).unwrap();
+        upsert_repo_prs(&mut conn, "ws", "r", &[(pr, "authored")]).unwrap();
+        let provider: String = conn
+            .query_row("SELECT r.provider FROM pull_requests p JOIN repositories r ON r.id = p.repository_id", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(provider, "bitbucket");
     }
 
     #[test]

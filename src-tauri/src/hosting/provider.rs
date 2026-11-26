@@ -48,12 +48,12 @@ fn github_mode(conn: &Connection) -> AppResult<String> {
     Ok(db::get_setting(conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into()))
 }
 
-/// `git fetch --prune` no clone local, para o Checkout e a aba Diff funcionarem sem rede.
-async fn fetch_clone(clone: &Path) -> Option<String> {
-    if clone.join(".git").exists() {
-        review::git::run(clone, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string())
-    } else {
-        Some(format!("clone local não encontrado em {}", clone.display()))
+/// `git fetch --prune` no clone local, para o Checkout e a aba Diff funcionarem sem rede. Clone
+/// ausente ou de outro repositório vira aviso, sem fetch.
+async fn fetch_clone(repo: &RepoRef, root: &Path) -> Option<String> {
+    match repo.clone_dir(root) {
+        Ok(dir) => review::git::run(&dir, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string()),
+        Err(e) => Some(e.to_string()),
     }
 }
 
@@ -65,7 +65,10 @@ impl Provider {
         if ws.is_some_and(|s| !s.trim().is_empty()) {
             out.push(Kind::Bitbucket);
         }
-        if !github::configured_repos(db::get_setting(conn, "github.repos")?)?.is_empty() {
+        // só a presença decide: um `owner/repo` mal escrito vira erro do sync do GitHub, sem tirar
+        // o Bitbucket do sync
+        let gh = db::get_setting(conn, "github.repos")?;
+        if gh.as_ref().and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
             out.push(Kind::Github);
         }
         Ok(out)
@@ -132,6 +135,14 @@ impl Provider {
                 db::set_setting(&*lock(db)?, "bitbucket.me", &json!({"uuid": me.uuid, "display_name": me.display_name}))?;
                 let repos = bitbucket_repos(&*lock(db)?)?;
                 for slug in repos {
+                    // um nome mal digitado (ex.: `ws/app`) falha só o próprio repositório, sem ir à API
+                    let rr = match RepoRef::new("bitbucket", s.workspace.clone(), slug.clone()) {
+                        Ok(rr) => rr,
+                        Err(e) => {
+                            out.push(RepoSync { slug, open: 0, error: Some(e.to_string()), fetch_error: None });
+                            continue;
+                        }
+                    };
                     let fetched = bitbucket::sync::fetch_repo(&s.client, &s.workspace, &slug, &me.uuid).await;
                     let (open, error) = match fetched {
                         Ok(prs) => {
@@ -140,8 +151,7 @@ impl Provider {
                         }
                         Err(e) => (0, Some(e.to_string())),
                     };
-                    let rr = RepoRef::new("bitbucket", s.workspace.clone(), slug.clone())?;
-                    out.push(RepoSync { slug, open, error, fetch_error: fetch_clone(&rr.clone_path(&root)).await });
+                    out.push(RepoSync { slug, open, error, fetch_error: fetch_clone(&rr, &root).await });
                 }
                 me.display_name
             }
@@ -158,7 +168,7 @@ impl Provider {
                         Err(e) => (0, Some(e.to_string())),
                     };
                     let rr = RepoRef::new("github", owner, name)?;
-                    out.push(RepoSync { slug: format!("{}/{}", rr.owner, rr.slug), open, error, fetch_error: fetch_clone(&rr.clone_path(&root)).await });
+                    out.push(RepoSync { slug: format!("{}/{}", rr.owner, rr.slug), open, error, fetch_error: fetch_clone(&rr, &root).await });
                 }
                 me.login
             }
@@ -287,6 +297,14 @@ mod tests {
         assert_eq!(Provider::configured(&conn).unwrap(), vec![Kind::Bitbucket, Kind::Github]);
     }
 
+    #[test]
+    fn github_mal_configurado_nao_tira_o_bitbucket() {
+        let conn = crate::db::open_in_memory().unwrap();
+        crate::db::set_setting(&conn, "bitbucket.workspace", &json!("ws")).unwrap();
+        crate::db::set_setting(&conn, "github.repos", &json!(["https://github.com/acme/app"])).unwrap();
+        assert_eq!(Provider::configured(&conn).unwrap(), vec![Kind::Bitbucket, Kind::Github]);
+    }
+
     #[tokio::test]
     async fn sync_do_bitbucket_pela_factory() {
         let pr = r#"{"id":1,"title":"PROJ-1","state":"OPEN","created_on":"2026-11-01T00:00:00Z","updated_on":"2026-11-02T00:00:00Z",
@@ -310,7 +328,7 @@ mod tests {
         let (user, repos) = p.sync(&db).await.unwrap();
         assert_eq!(user, "Eu");
         assert_eq!((repos[0].slug.as_str(), repos[0].open, repos[0].error.is_none()), ("r", 1, true));
-        assert!(repos[0].fetch_error.as_deref().is_some_and(|e| e.contains("clone local não encontrado")));
+        assert!(repos[0].fetch_error.as_deref().is_some_and(|e| e.contains("não achei o clone local")));
         let conn = db.lock().unwrap();
         assert_eq!(crate::hosting::me(&conn, Kind::Bitbucket).unwrap().as_deref(), Some("{me}"));
         let (cat, status): (String, String) = conn
@@ -329,6 +347,20 @@ mod tests {
         let err = p.publish(&rr, 1, "abc", "corpo", "<!-- m -->", &[], false).await.unwrap_err();
         assert_eq!(err.to_string(), "o Crivo não escreve no Bitbucket");
         assert_eq!(p.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn slug_invalido_falha_so_o_proprio_repositorio() {
+        let srv = start(vec![ok(r#"{"uuid":"{me}","display_name":"Eu"}"#), ok(r#"{"values":[]}"#), ok(r#"{"values":[]}"#)]);
+        let db = std::sync::Mutex::new(crate::db::open_in_memory().unwrap());
+        crate::db::set_setting(&db.lock().unwrap(), "bitbucket.repos", &json!(["ws/app", "r"])).unwrap();
+        let client = crate::bitbucket::client::Client::with_base(&srv.base, "e@x", "tok-secreto-123456").unwrap();
+        let p = Provider::Bitbucket(BitbucketSession { client, workspace: "ws".into() });
+        let (_, repos) = p.sync(&db).await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert!(repos[0].slug == "ws/app" && repos[0].error.as_deref().is_some_and(|e| e.contains("inválido")), "{:?}", repos[0]);
+        assert!(repos[1].slug == "r" && repos[1].error.is_none(), "{:?}", repos[1]);
+        assert_eq!(p.requests(), 3, "o slug inválido não vai para a API");
     }
 
     #[tokio::test]

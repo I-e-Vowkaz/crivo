@@ -275,14 +275,7 @@ fn repo_of(conn: &Connection, slug: &str) -> AppResult<PathBuf> {
 
 fn repo_of_target(conn: &Connection, t: &Target) -> AppResult<PathBuf> {
     let Some(rr) = &t.repo else { return repo_of(conn, &t.slug) };
-    let repo = rr.clone_path(&review::repos_root(conn)?);
-    if !repo.join(".git").exists() {
-        return Err(AppError::Invalid(format!(
-            "não achei o clone local de {} em {} (ajuste a pasta dos repositórios nas Configurações)",
-            rr.slug,
-            repo.display()
-        )));
-    }
+    let repo = rr.clone_dir(&review::repos_root(conn)?)?;
     Ok(repo)
 }
 

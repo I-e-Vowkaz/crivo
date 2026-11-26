@@ -94,6 +94,33 @@ impl RepoRef {
         root.join(&self.slug)
     }
 
+    /// O clone local, conferido: existe e o `origin` dele é este repositório. Sem a conferência, um
+    /// `<root>/<slug>` de outro dono (ou do outro provedor) seria revisado no lugar deste.
+    pub fn clone_dir(&self, root: &Path) -> AppResult<PathBuf> {
+        let dir = self.clone_path(root);
+        if !dir.join(".git").exists() {
+            return Err(AppError::Invalid(format!(
+                "não achei o clone local de {}/{} em {} (ajuste a pasta dos repositórios nas Configurações)",
+                self.owner,
+                self.slug,
+                dir.display()
+            )));
+        }
+        let out = std::process::Command::new("git").arg("-C").arg(&dir).args(["remote", "get-url", "origin"]).output()?;
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !out.status.success() || !origin_matches(&url, &self.owner, &self.slug) {
+            return Err(AppError::Invalid(format!(
+                "o clone em {} aponta para {}, não para {}/{} no {}",
+                dir.display(),
+                if url.is_empty() { "nenhum origin" } else { &url },
+                self.owner,
+                self.slug,
+                self.kind.name()
+            )));
+        }
+        Ok(dir)
+    }
+
     /// `slug#N` no Bitbucket, `owner/slug#N` no GitHub.
     pub fn label(&self, number: i64) -> String {
         match self.kind {
@@ -130,6 +157,16 @@ impl RepoRef {
             Kind::Github => git::checkout_github(repo, number).await,
         }
     }
+}
+
+/// O `origin` termina em `owner/slug` (com ou sem `.git`), sem diferenciar maiúsculas. O host
+/// não entra: o clone pode usar um apelido de ssh (`git@bitbucket-trabalho:ws/app.git`).
+fn origin_matches(url: &str, owner: &str, slug: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url).to_lowercase();
+    let mut parts = url.rsplit(['/', ':']);
+    let (Some(s), Some(o)) = (parts.next(), parts.next()) else { return false };
+    s == slug.to_lowercase() && o == owner.to_lowercase()
 }
 
 /// Quem eu sou no provedor, gravado no último sync: o `uuid` no Bitbucket e o `login` no GitHub
@@ -241,6 +278,33 @@ mod tests {
         crate::db::set_setting(&conn, "github.me", &serde_json::json!({"login": "eu", "id": 7})).unwrap();
         assert_eq!(me(&conn, Kind::Bitbucket).unwrap().as_deref(), Some("{u1}"));
         assert_eq!(me(&conn, Kind::Github).unwrap().as_deref(), Some("eu"));
+    }
+
+    #[test]
+    fn origin_do_mesmo_repositorio() {
+        assert!(origin_matches("git@github.com:acme/app.git", "acme", "app"));
+        assert!(origin_matches("https://github.com/acme/app/", "acme", "app"));
+        assert!(origin_matches("https://eu@bitbucket.org/ws/app.git\n", "ws", "app"));
+        assert!(origin_matches("git@bitbucket-trabalho:WS/App.git", "ws", "app"), "apelido de ssh e maiúsculas");
+        assert!(!origin_matches("git@github.com:outro/app.git", "acme", "app"));
+        assert!(!origin_matches("git@github.com:acme/app-front.git", "acme", "app"));
+    }
+
+    #[test]
+    fn clone_de_outro_repositorio_e_recusado() {
+        let root = std::env::temp_dir().join(format!("crivo-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@github.com:acme/app.git"]);
+        assert_eq!(RepoRef::new("github", "acme", "app").unwrap().clone_dir(&root).unwrap(), dir);
+        let outro = RepoRef::new("github", "outro", "app").unwrap().clone_dir(&root).unwrap_err().to_string();
+        assert!(outro.contains("aponta para git@github.com:acme/app.git"), "{outro}");
+        assert!(RepoRef::new("bitbucket", "ws", "app").unwrap().clone_dir(&root).is_err(), "clone plano do GitHub no lugar do Bitbucket");
+        assert!(RepoRef::new("github", "acme", "nada").unwrap().clone_dir(&root).unwrap_err().to_string().contains("não achei o clone"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

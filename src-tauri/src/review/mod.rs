@@ -477,7 +477,7 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
     if git::is_protected(&pr.source_branch) {
         return Err(AppError::Invalid(format!("recusado: a branch de origem {} é protegida", pr.source_branch)));
     }
-    let repo = match &pr.repo { Some(rr) => rr.clone_path(root), None => root.join(&pr.slug) };
+    let repo = match &pr.repo { Some(rr) => rr.clone_dir(root)?, None => root.join(&pr.slug) };
     if !repo.join(".git").exists() {
         return Err(AppError::Invalid(format!(
             "não achei o clone local de {} em {} (ajuste a pasta dos repositórios nas Configurações)",

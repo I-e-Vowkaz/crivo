@@ -249,7 +249,7 @@ async fn answer(
         let _ = app.emit("chat-update", ChatEvent { run_id, line: Some(line), busy: true });
     };
     // worktree do chat no commit revisado (o do review já foi removido)
-    let repo = match &info.repo { Some(rr) => rr.clone_path(root), None => root.join(&info.slug) };
+    let repo = match &info.repo { Some(rr) => rr.clone_dir(root)?, None => root.join(&info.slug) };
     let wt = info.run_dir.join("chat-wt");
     if !wt.join(".git").exists() {
         log("preparando o código do commit revisado");

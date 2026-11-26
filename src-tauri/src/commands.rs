@@ -637,10 +637,7 @@ pub async fn checkout_pr(state: State<'_, AppState>, pr_id: i64) -> AppResult<Ch
         )?;
         (rr, branch, sha, number, review::repos_root(&conn)?)
     };
-    let repo = rr.clone_path(&root);
-    if !repo.join(".git").exists() {
-        return Err(AppError::Invalid(format!("não achei o clone de {} em {}", rr.slug, repo.display())));
-    }
+    let repo = rr.clone_dir(&root)?;
     let (branch, head) = rr.checkout(&repo, number, &branch).await?;
     Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: rr.slug, branch, head })
 }

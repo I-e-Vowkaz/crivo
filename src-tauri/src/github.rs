@@ -262,13 +262,14 @@ pub async fn sync_repo(
     repo: &str,
     all: Vec<Pull>,
 ) -> AppResult<usize> {
-    // só os PRs que me dizem respeito têm os reviews lidos (uma chamada por PR)
-    let reviewed = api.reviewed_by_me(owner, repo).await?;
+    // só os PRs que me dizem respeito têm os reviews lidos (uma chamada por PR). Se a busca
+    // falhar (limite de taxa da busca), lê os reviews de todos e decide por eles, como antes.
+    let reviewed = api.reviewed_by_me(owner, repo).await.ok();
     let mut relevant = Vec::new();
     for pr in all {
         let mine = pr.user.id == me.id;
         let requested = pr.requested_reviewers.iter().any(|u| u.id == me.id);
-        if !mine && !requested && !reviewed.contains(&pr.number) {
+        if reviewed.as_ref().is_some_and(|set| !mine && !requested && !set.contains(&pr.number)) {
             continue;
         }
         let reviews: Vec<Value> = api
@@ -277,6 +278,10 @@ pub async fn sync_repo(
                 pr.number
             ))
             .await?;
+        let by_me = reviews.iter().any(|r| r.pointer("/user/id").and_then(Value::as_i64) == Some(me.id));
+        if reviewed.is_none() && !mine && !requested && !by_me {
+            continue;
+        }
         let mut reviewers: std::collections::BTreeMap<String, Value> =
             std::collections::BTreeMap::new();
         for r in reviews {
@@ -598,6 +603,24 @@ mod sync_tests {
             "requested_reviewers": req
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sem_a_busca_le_os_reviews_de_todos() {
+        use crate::bitbucket::client::testserver::Canned;
+        // a busca falha (limite de taxa): o sync lê os reviews de todos, como antes da busca
+        let srv = start(vec![
+            Canned { status: 403, headers: vec![], body: r#"{"message":"rate limit"}"#.into() },
+            ok("[]"),
+            ok(r#"[{"user":{"login":"eu","id":7},"state":"APPROVED"}]"#),
+            ok("[]"),
+        ]);
+        let api = Api::with_base(&srv.base, "tok".into()).unwrap();
+        let me = User { login: "eu".into(), id: 7 };
+        let db = std::sync::Mutex::new(crate::db::open_in_memory().unwrap());
+        let pulls = vec![pull(1, "eu", &[]), pull(2, "outro", &[]), pull(3, "outro", &[])];
+        assert_eq!(sync_repo(&db, &api, &me, "acme", "app", pulls).await.unwrap(), 2);
+        assert_eq!(api.requests(), 4);
     }
 
     #[tokio::test]
