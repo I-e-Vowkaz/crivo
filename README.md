@@ -67,6 +67,10 @@ pr-review-orchestrator --sync                 # só atualiza a lista de PRs
 
 Cada comando tem `--help`. Em `packaging/claude-skill/` há skills do Claude Code que chamam esses comandos, e em `packaging/systemd/` um timer que atualiza a lista todo dia.
 
+## Provedores (para quem mexe no código)
+
+Tudo que depende do Bitbucket ou do GitHub fica em `src-tauri/src/hosting/`. O `RepoRef` resolve o que não usa rede (caminho do clone, rótulo, filtro `--repo`, refs do git) e o `Provider::connect` é a factory que devolve o cliente autenticado (sync, comentários abertos, push da correção, contexto extra, publicação). O resto do app não compara o nome do provedor. Um provedor novo é uma variante a mais em `Kind` e em `Provider`, e o compilador aponta cada método que precisa tratá-la.
+
 ## Segurança
 
 - O review só lê. O hook `claude/hooks/guard-git.py` bloqueia commit, push, merge, rebase, tag e checkout ou reset de branch protegida.
