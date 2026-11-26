@@ -66,6 +66,24 @@ pub async fn checkout_synced(repo: &Path, slug: &str, branch: &str) -> AppResult
     run(repo, &["rev-parse", "HEAD"]).await
 }
 
+/// Checkout local de uma PR GitHub, inclusive quando a origem é um fork.
+pub async fn checkout_github(repo: &Path, number: i64) -> AppResult<(String, String)> {
+    let dirty = run(repo, &["status", "--porcelain", "--untracked-files=no"]).await?;
+    if !dirty.is_empty() { return Err(AppError::Invalid("há alterações locais sem commit; faça commit ou stash".into())); }
+    let branch = format!("crivo/pr-{number}");
+    let source = format!("refs/pull/{number}/head");
+    let remote = format!("refs/remotes/origin/pr/{number}");
+    run(repo, &["fetch", "-q", "origin", &format!("+{source}:{remote}")]).await?;
+    let exists = raw(repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).await?.code == 0;
+    if exists {
+        run(repo, &["switch", "-q", &branch]).await?;
+        run(repo, &["merge", "-q", "--ff-only", &remote]).await?;
+    } else {
+        run(repo, &["switch", "-q", "-c", &branch, &remote]).await?;
+    }
+    Ok((branch, run(repo, &["rev-parse", "HEAD"]).await?))
+}
+
 /// Base do review de uma branch local: `dev` se a origin tiver, senão a branch padrão da origin
 /// (`origin/HEAD`), senão `main` ou `master`. Sem rede: olha os refs que o clone já tem.
 pub async fn default_base(repo: &Path) -> Option<String> {

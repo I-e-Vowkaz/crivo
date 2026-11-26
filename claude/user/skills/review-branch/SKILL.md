@@ -139,7 +139,7 @@ O arquivo JSON indicado traz:
   - `conflicts`: lista de arquivos em conflito com a base, já calculada pelo app (pode ser vazia);
   - `obs`: observações opcionais.
 - `jira_site`: site do Jira configurado no app (ex.: `empresa.atlassian.net`), quando houver. É o `cloudId` do passo 2;
-- `card_file`: caminho de um Markdown com o card do Jira já lido pelo app (chave, título, tipo, status, prioridade, descrição, critérios de aceite, comentários relevantes, card pai), ou com o contexto escrito pelo usuário.
+- `card_file`: caminho de um Markdown com o contexto da PR, GitHub Issues referenciadas quando houver e, nas branches locais, o contexto disponível para o review. Leia esse arquivo mesmo sem `card_key`.
 
 ### O que muda em relação ao uso manual
 
@@ -181,7 +181,7 @@ Preencha também `status` por projeto (`ok`, `sem_card`, `sem_alteracoes` ou `er
 
 ### Card pelo MCP (`card_key`)
 
-Acréscimo de 2026-11-17. Se o manifest trouxer `card_key` (ex.: `PROJ-1676`), o passo 2 muda assim:
+Acréscimo de 2026-11-17. Se o manifest trouxer `card_key` (ex.: `PROJ-1676`), o Jira foi configurado explicitamente e o passo 2 muda assim:
 
 - Leia o card pelo MCP do Atlassian **exatamente como no passo 2 do uso manual**: ToolSearch para carregar `mcp__atlassian__getJiraIssue`, os mesmos parâmetros e o card pai em um nível. Use-o como `CARD`.
 - Nesse caso o `card_file` traz os dados do PR (título, descrição, branches e autor). Junte-os ao `CARD` como contexto.

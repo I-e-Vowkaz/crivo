@@ -24,7 +24,7 @@ const USAGE: &str = "\
 uso: pr-review-orchestrator comments <branch> [ação] [opções]
 
 Os comentários abertos dos seus PRs da branch, como na tela Meus PRs do app. Sem ação, busca
-no Bitbucket os comentários novos e lista todos, sem rodar o Claude.
+no provedor da PR os comentários novos e lista todos, sem rodar o Claude.
 
 ações:
   analyze <C1 C3 …|all>   o Sonnet confere os comentários no código e propõe a correção
@@ -34,14 +34,14 @@ ações:
   discard                 descarta a correção e o que foi aprovado sem commit
 
 opções:
-  --repo <slug>              só neste repositório (obrigatório nas ações se houver PR seu
+  --repo <slug|owner/repo>   só neste repositório (obrigatório nas ações se houver PR seu
                              no front e no back da mesma branch)
-  --sync                     atualiza os PRs do Bitbucket antes de procurar
+  --sync                     atualiza os PRs configurados antes de procurar
   --output-format text|json  formato no stdout (padrão: text)
   --verbose                  também escreve o log detalhado no stderr
   -h, --help                 mostra esta ajuda
 
-Nada é escrito no Bitbucket além do push do commit.
+Comentários de review são publicados apenas pela ação explícita no painel do app.
 
 saída: 0 ok, 1 a etapa falhou, 2 erro de uso, PR não encontrado ou estado que não aceita a
 ação, 130 se foi cancelado (Ctrl+C ou SIGTERM).";
@@ -150,17 +150,19 @@ struct MyPr {
 /// PRs abertos da branch que eu abri (os de outras pessoas são do `-p`).
 fn my_open_prs(conn: &Connection, branch: &str, repo: Option<&str>) -> AppResult<Vec<MyPr>> {
     let mut stmt = conn.prepare(
-        "SELECT p.id, r.slug, p.source_branch, p.bb_id, p.title, p.url
+        "SELECT p.id, r.slug, p.source_branch, p.bb_id, p.title, p.url, r.provider, r.workspace
          FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
          WHERE p.state = 'OPEN' AND p.category != 'review_requested' AND lower(p.source_branch) = lower(?1)
-           AND (?2 IS NULL OR r.slug = ?2)
-         ORDER BY r.slug",
+           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))
+         ORDER BY r.provider, r.workspace, r.slug",
     )?;
     let rows = stmt.query_map(params![branch, repo], |r| {
         let slug: String = r.get(1)?;
+        let provider: String = r.get(6)?;
+        let owner: String = r.get(7)?;
         Ok(MyPr {
             id: r.get(0)?,
-            label: format!("{slug}#{}", r.get::<_, i64>(3)?),
+            label: if provider == "github" { format!("{owner}/{slug}#{}", r.get::<_, i64>(3)?) } else { format!("{slug}#{}", r.get::<_, i64>(3)?) },
             slug,
             branch: r.get(2)?,
             title: r.get(4)?,
@@ -174,7 +176,7 @@ fn others_open_prs_count(conn: &Connection, branch: &str, repo: Option<&str>) ->
     Ok(conn.query_row(
         "SELECT count(*) FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
          WHERE p.state = 'OPEN' AND p.category = 'review_requested' AND lower(p.source_branch) = lower(?1)
-           AND (?2 IS NULL OR r.slug = ?2)",
+           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))",
         params![branch, repo],
         |r| r.get(0),
     )?)

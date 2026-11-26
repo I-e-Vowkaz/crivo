@@ -30,7 +30,7 @@ pipeline do app: Sonnet, validação, melhorias do Haiku com o juiz e auditoria 
 O teste no navegador não roda pelo terminal.
 
 opções:
-  --repo <slug>              só neste repositório (ex.: acme-back)
+  --repo <slug|owner/repo>   só neste repositório (GitHub: owner/repo)
   --sync                     atualiza os PRs do Bitbucket antes de procurar
   --output-format text|json  formato do relatório no stdout (padrão: text)
   --verbose                  também escreve o log detalhado no stderr
@@ -94,14 +94,18 @@ impl Target {
 
 fn open_prs(conn: &Connection, branch: &str, repo: Option<&str>) -> AppResult<Vec<Target>> {
     let mut stmt = conn.prepare(
-        "SELECT p.id, r.slug, p.bb_id, p.title, p.url FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
-         WHERE p.state = 'OPEN' AND lower(p.source_branch) = lower(?1) AND (?2 IS NULL OR r.slug = ?2)
-         ORDER BY r.slug",
+        "SELECT p.id, r.slug, p.bb_id, p.title, p.url, r.provider, r.workspace FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
+         WHERE p.state = 'OPEN' AND lower(p.source_branch) = lower(?1)
+           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))
+         ORDER BY r.provider, r.workspace, r.slug",
     )?;
     let rows = stmt.query_map(params![branch, repo], |r| {
         let slug: String = r.get(1)?;
         let bb_id: i64 = r.get(2)?;
-        Ok(Target::Pr { id: r.get(0)?, label: format!("{slug}#{bb_id}"), title: r.get(3)?, url: r.get(4)? })
+        let provider: String = r.get(5)?;
+        let owner: String = r.get(6)?;
+        let label = if provider == "github" { format!("{owner}/{slug}#{bb_id}") } else { format!("{slug}#{bb_id}") };
+        Ok(Target::Pr { id: r.get(0)?, label, title: r.get(3)?, url: r.get(4)? })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -198,7 +202,7 @@ pub fn run(argv: &[String]) -> i32 {
 pub(super) fn cli_host(verbose: bool) -> Result<Arc<CliHost>, i32> {
     let db_path = crate::data_dir_headless().join("app.db");
     if !db_path.exists() {
-        eprintln!("banco não encontrado em {}; abra o app uma vez e configure o Bitbucket", db_path.display());
+        eprintln!("banco não encontrado em {}; abra o app uma vez e configure um provedor", db_path.display());
         return Err(2);
     }
     let conn = match db::open(&db_path) {
@@ -220,6 +224,7 @@ pub(super) fn cli_host(verbose: bool) -> Result<Arc<CliHost>, i32> {
             reviews: Default::default(),
             review_slots: Arc::new(tokio::sync::Semaphore::new(5)),
             browser_lock: tokio::sync::Mutex::new(()),
+            publish_lock: tokio::sync::Mutex::new(()),
             claude_limit: Mutex::new(None),
         },
         verbose,

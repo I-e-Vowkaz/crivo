@@ -32,7 +32,7 @@ pub struct Account {
     pub validated_at: Option<String>,
 }
 
-/// Confere o token contra a API: usuário, escopos só de leitura e acesso ao workspace.
+/// Confere o token contra a API: leitura obrigatória e escrita em PR opcional.
 /// Não grava nada: quem chama decide se salva.
 pub async fn validate(client: &Client, workspace: &str) -> AppResult<Account> {
     let r = client.get_json::<User>("/user", &[]).await?;
@@ -40,7 +40,7 @@ pub async fn validate(client: &Client, workspace: &str) -> AppResult<Account> {
     let Some(scopes) = scopes::parse(header) else {
         return Err(AppError::Invalid(
             "o Bitbucket não informou os escopos deste token (header X-Oauth-Scopes), então não dá para \
-             garantir que ele é só leitura. Crie um API token com escopos: read:pullrequest, read:repository e read:user"
+             validar suas permissões. Crie um API token com escopos: read:pullrequest, read:repository e read:user"
                 .into(),
         ));
     };
@@ -68,14 +68,14 @@ fn scope_error(c: &ScopeCheck) -> String {
     let mut parts = Vec::new();
     if !c.forbidden.is_empty() {
         parts.push(format!(
-            "o token tem permissões além de leitura ({}); o app só aceita token somente leitura",
+            "o token tem permissões não usadas pelo app ({})",
             c.forbidden.join(", ")
         ));
     }
     if !c.missing.is_empty() {
         parts.push(format!("faltam os escopos {}", c.missing.join(", ")));
     }
-    format!("{}. Crie um API token só com read:pullrequest, read:repository e read:user", parts.join("; "))
+    format!("{}. Use read:pullrequest, read:repository e read:user; write:pullrequest é opcional para publicar", parts.join("; "))
 }
 
 /// Email e workspace salvos nas configurações; erro claro se faltarem.
@@ -167,7 +167,7 @@ mod tests {
     async fn token_com_escrita_e_recusado() {
         let srv = start(vec![user_resp(Some(&format!("{READ_SCOPES}, write:repository:bitbucket")))]);
         let err = validate(&client(&srv.base), "acme").await.unwrap_err().to_string();
-        assert!(err.contains("além de leitura (write:repository:bitbucket)"), "{err}");
+        assert!(err.contains("permissões não usadas pelo app (write:repository:bitbucket)"), "{err}");
     }
 
     #[tokio::test]

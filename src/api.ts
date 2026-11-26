@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ref } from "vue";
 
-export type SecretKind = "bitbucket" | "jira";
+export type SecretKind = "bitbucket" | "jira" | "github";
 
 export interface AppInfo {
   version: string;
@@ -50,6 +50,8 @@ export interface LastRun {
 export interface Pr {
   id: number;
   repo: string;
+  provider: "bitbucket" | "github";
+  owner: string;
   bb_id: number;
   title: string;
   url: string;
@@ -373,6 +375,9 @@ export const api = {
   bitbucketSaveToken: (value: string) => invoke<BitbucketAccount>("bitbucket_save_token", { value }),
   bitbucketValidate: () => invoke<BitbucketAccount>("bitbucket_validate"),
   bitbucketAccount: () => invoke<BitbucketAccount | null>("bitbucket_account"),
+  githubSaveToken: (value: string) => invoke<{login: string; mode: string}>("github_save_token", { value }),
+  githubUseGh: () => invoke<{login: string; mode: string}>("github_use_gh"),
+  githubLogin: () => invoke<void>("github_login"),
   syncPrs: () => invoke<SyncResult>("sync_prs"),
   listPrs: () => invoke<PrList>("list_prs"),
   usageGet: () => invoke<Usage>("usage_get"),
@@ -389,6 +394,7 @@ export const api = {
   reviewStart: (prId: number) => invoke<string>("review_start", { prId }),
   reviewCancel: (runId: string) => invoke<void>("review_cancel", { runId }),
   reviewGet: (runId: string) => invoke<Run>("review_get", { runId }),
+  publishFindings: (runId: string, seqs: number[], requestChanges: boolean) => invoke<{seq: number; url: string | null}[]>("publish_findings", { runId, seqs, requestChanges }),
   testAppsGet: () => invoke<TestAppView[]>("test_apps_get"),
   testAppSave: (apps: TestApp[], passwordFor?: string, password?: string) =>
     invoke<TestAppView[]>("test_app_save", { apps, passwordFor, password }),

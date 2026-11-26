@@ -7,7 +7,9 @@ mod db;
 mod diff;
 mod error;
 mod fix;
+mod github;
 mod proc;
+mod publish;
 mod review;
 mod secrets;
 mod testenv;
@@ -139,6 +141,7 @@ pub fn run() {
                 reviews: Default::default(),
                 review_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(5)),
                 browser_lock: tokio::sync::Mutex::new(()),
+                publish_lock: tokio::sync::Mutex::new(()),
                 claude_limit: Mutex::new(None),
             });
             Ok(())
@@ -153,11 +156,15 @@ pub fn run() {
             commands::bitbucket_save_token,
             commands::bitbucket_validate,
             commands::bitbucket_account,
+            commands::github_save_token,
+            commands::github_use_gh,
+            commands::github_login,
             commands::sync_prs,
             commands::list_prs,
             commands::review_start,
             commands::review_cancel,
             commands::review_get,
+            publish::publish_findings,
             commands::test_apps_get,
             commands::test_app_save,
             commands::checkout_pr,

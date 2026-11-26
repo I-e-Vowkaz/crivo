@@ -12,6 +12,7 @@ import { panelWide, togglePanelWide } from "../panelWide";
 const props = defineProps<{ pr?: Pr; branch?: { slug: string; name: string } }>();
 const emit = defineEmits<{ close: [] }>();
 const isPr = computed(() => !!props.pr);
+const providerName = computed(() => props.pr?.provider === "github" ? "GitHub" : "Bitbucket");
 const branchName = computed(() => props.pr?.source_branch ?? props.branch?.name ?? "");
 
 const fix = ref<FixSession | null>(null);
@@ -427,7 +428,7 @@ onUnmounted(() => {
       </p>
       <template v-if="loaded && !fix && pr">
         <p class="muted">
-          Busca os comentários abertos deste PR no Bitbucket ({{ pr.comment_count ?? "?" }} no total, contando os seus),
+          Busca os comentários abertos deste PR no {{ providerName }} ({{ pr.comment_count ?? "?" }} no total, contando os seus),
           sem rodar o Claude. Depois você escolhe quais analisar: o Sonnet confere cada um no código da branch e propõe a
           correção quando procede. Nada muda no código até você aprovar a sugestão.
         </p>
@@ -530,7 +531,7 @@ onUnmounted(() => {
             <code>{{ place(c) }}</code>
             <template v-if="c.outdated"> · código mudou depois do comentário</template>
             · {{ formatDate(c.created_on) }}
-            <template v-if="c.url"> · <a href="#" @click.prevent="openUrl(c.url)">abrir no Bitbucket</a></template>
+            <template v-if="c.url"> · <a href="#" @click.prevent="openUrl(c.url)">abrir no {{ providerName }}</a></template>
           </div>
           <!-- eslint-disable-next-line vue/no-v-html -->
           <blockquote class="comment-body md" v-html="renderMd(c.body)" />

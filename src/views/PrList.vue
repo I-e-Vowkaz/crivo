@@ -221,7 +221,7 @@ onUnmounted(() => {
               @click="show(pr)"
             >
               <td class="pr-main">
-                <a href="#" @click.prevent.stop="openUrl(pr.url)">{{ pr.repo }}#{{ pr.bb_id }}</a>
+                <a href="#" @click.prevent.stop="openUrl(pr.url)">{{ pr.provider === "github" ? `${pr.owner}/${pr.repo}` : pr.repo }}#{{ pr.bb_id }}</a>
                 <span class="title">{{ pr.title }}</span>
                 <div class="muted small">
                   <a

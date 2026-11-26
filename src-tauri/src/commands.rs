@@ -10,6 +10,7 @@ use tauri::{Emitter, State};
 
 use crate::bitbucket::{self, Account, client::Client};
 use crate::db;
+use crate::github;
 use crate::review;
 use crate::error::{AppError, AppResult};
 use crate::secrets::{self, KeyringStore, SecretKind, SecretStore};
@@ -25,6 +26,7 @@ pub struct AppState {
     pub review_slots: std::sync::Arc<tokio::sync::Semaphore>,
     /// Um navegador só: um Browser Tester por vez.
     pub browser_lock: tokio::sync::Mutex<()>,
+    pub publish_lock: tokio::sync::Mutex<()>,
     /// Limite de uso do Claude atingido: reviews pausam e o chat recusa até liberar.
     pub claude_limit: Mutex<Option<review::LimitState>>,
 }
@@ -70,9 +72,8 @@ pub fn secret_status(state: State<'_, AppState>, kind: SecretKind) -> AppResult<
 
 #[tauri::command]
 pub fn secret_save(state: State<'_, AppState>, kind: SecretKind, value: String) -> AppResult<SecretStatus> {
-    if kind == SecretKind::Bitbucket {
-        // o token do Bitbucket só é salvo depois de validado: `bitbucket_save_token`
-        return Err(AppError::Invalid("use bitbucket_save_token para o token do Bitbucket".into()));
+    if kind == SecretKind::Bitbucket || kind == SecretKind::Github {
+        return Err(AppError::Invalid("use o comando de validação do provedor para salvar o token".into()));
     }
     secrets::save(&*state.conn()?, state.secrets.as_ref(), kind, &value)?;
     secret_status(state, kind)
@@ -85,6 +86,8 @@ pub fn secret_delete(state: State<'_, AppState>, kind: SecretKind) -> AppResult<
         secrets::remove(&conn, state.secrets.as_ref(), kind)?;
         if kind == SecretKind::Bitbucket {
             bitbucket::forget_account(&conn)?;
+        } else if kind == SecretKind::Github {
+            db::set_setting(&conn, "github.auth_mode", &serde_json::json!("gh"))?;
         }
     }
     secret_status(state, kind)
@@ -128,6 +131,37 @@ pub fn bitbucket_account(state: State<'_, AppState>) -> AppResult<Option<Account
     bitbucket::stored_account(&*state.conn()?)
 }
 
+#[derive(Serialize)]
+pub struct GithubAccount { login: String, mode: String }
+
+#[tauri::command]
+pub async fn github_save_token(state: State<'_, AppState>, value: String) -> AppResult<GithubAccount> {
+    let token = secrets::normalize_secret(&value)?;
+    let api = github::Api::new(token.clone())?;
+    let user: github::User = api.get("/user").await?;
+    let conn = state.conn()?;
+    secrets::save(&conn, state.secrets.as_ref(), SecretKind::Github, &token)?;
+    db::set_setting(&conn, "github.auth_mode", &serde_json::json!("token"))?;
+    Ok(GithubAccount { login: user.login, mode: "token".into() })
+}
+
+#[tauri::command]
+pub async fn github_use_gh(state: State<'_, AppState>) -> AppResult<GithubAccount> {
+    let token = github::token("gh", state.secrets.as_ref()).await?;
+    let user: github::User = github::Api::new(token)?.get("/user").await?;
+    let conn = state.conn()?;
+    db::set_setting(&conn, "github.auth_mode", &serde_json::json!("gh"))?;
+    Ok(GithubAccount { login: user.login, mode: "gh".into() })
+}
+
+#[tauri::command]
+pub fn github_login() -> AppResult<()> {
+    std::process::Command::new("x-terminal-emulator")
+        .args(["-e", "gh", "auth", "login", "--hostname", "github.com", "--web", "--git-protocol", "https"])
+        .spawn().map_err(|e| AppError::Invalid(format!("não consegui abrir o terminal para gh auth login: {e}")))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn setting_get(state: State<'_, AppState>, key: String) -> AppResult<Option<Value>> {
     db::get_setting(&*state.conn()?, &key)
@@ -167,6 +201,81 @@ fn lock(db: &Mutex<Connection>) -> AppResult<std::sync::MutexGuard<'_, Connectio
 
 /// O sync em si: usado pela tela e pelo modo sem janela (`--sync`, timer das 10h).
 pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
+    let has_bitbucket = {
+        let conn = lock(db)?;
+        db::get_setting(&conn, "bitbucket.workspace")?.and_then(|v| v.as_str().map(str::to_owned)).is_some_and(|s| !s.trim().is_empty())
+    };
+    let mut result = bitbucket::sync::SyncResult { user: String::new(), repos: Vec::new(), requests: 0 };
+    if has_bitbucket {
+        match sync_bitbucket(db, store).await {
+            Ok(r) => result = r,
+            Err(e) => result.repos.push(bitbucket::sync::RepoSync {
+                slug: "Bitbucket".into(), open: 0, error: Some(e.to_string()), fetch_error: None,
+            }),
+        }
+    }
+    let (repos, mode, root) = {
+        let conn = lock(db)?;
+        let repos = github::configured_repos(db::get_setting(&conn, "github.repos")?)?;
+        let mode = db::get_setting(&conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into());
+        let root = review::repos_root(&conn)?;
+        (repos, mode, root)
+    };
+    if !repos.is_empty() {
+        let auth = async {
+            let token = github::token(&mode, store).await?;
+            let api = github::Api::new(token)?;
+            let me: github::User = api.get("/user").await?;
+            Ok::<_, AppError>((api, me))
+        }.await;
+        let (api, me) = match auth {
+            Ok(pair) => pair,
+            Err(e) => {
+                result.repos.extend(repos.into_iter().map(|(owner, name)| bitbucket::sync::RepoSync {
+                    slug: format!("{owner}/{name}"), open: 0, error: Some(format!("GitHub: {e}")), fetch_error: None,
+                }));
+                return Ok(result);
+            }
+        };
+        let sync_id = {
+            let conn = lock(db)?;
+            conn.execute("INSERT INTO sync_runs (kind, status) VALUES ('full', 'running')", [])?;
+            conn.last_insert_rowid()
+        };
+        {
+            let conn = lock(db)?;
+            db::set_setting(&conn, "github.me", &serde_json::json!({"login": me.login, "id": me.id}))?;
+        }
+        if result.user.is_empty() { result.user = me.login.clone(); }
+        for (owner, name) in repos {
+            let fetched = api.pulls(&owner, &name).await;
+            let (open, error) = match fetched {
+                Ok(pulls) => {
+                    // `sync` também consulta os reviews de cada PR.
+                    match github::sync_repo(db, &api, &me, &owner, &name, pulls).await {
+                        Ok(n) => (n, None), Err(e) => (0, Some(e.to_string()))
+                    }
+                }
+                Err(e) => (0, Some(e.to_string())),
+            };
+            let clone = github::clone_path(&root, &owner, &name);
+            let fetch_error = if clone.join(".git").exists() {
+                review::git::run(&clone, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string())
+            } else { Some(format!("clone local não encontrado em {}", clone.display())) };
+            result.repos.push(bitbucket::sync::RepoSync { slug: format!("{owner}/{name}"), open, error, fetch_error });
+        }
+        let failed = result.repos.iter().filter_map(|r| r.error.as_ref()).cloned().collect::<Vec<_>>();
+        result.requests += api.requests();
+        lock(db)?.execute("UPDATE sync_runs SET status = ?1, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), error = ?2, requests = ?3 WHERE id = ?4",
+            rusqlite::params![if failed.is_empty() { "completed" } else { "failed" }, (!failed.is_empty()).then(|| failed.join("; ")), api.requests(), sync_id])?;
+    }
+    if !has_bitbucket && result.repos.is_empty() {
+        return Err(AppError::Invalid("configure ao menos um repositório Bitbucket ou GitHub".into()));
+    }
+    Ok(result)
+}
+
+async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
     let (email, workspace, repos) = {
         let conn = lock(db)?;
         let (email, workspace) = bitbucket::account_settings(&conn)?;
@@ -241,6 +350,8 @@ pub struct LastRun {
 pub struct PrView {
     id: i64,
     repo: String,
+    provider: String,
+    owner: String,
     bb_id: i64,
     title: String,
     url: String,
@@ -283,6 +394,8 @@ pub fn list_prs(state: State<'_, AppState>) -> AppResult<PrList> {
 pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
     let me: Option<String> = db::get_setting(&conn, "bitbucket.me")?
         .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned));
+    let github_me: Option<String> = db::get_setting(&conn, "github.me")?
+        .and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned));
     let mut stmt = conn.prepare(
         "SELECT p.id, r.slug, p.bb_id, p.title, p.url, p.author_name, p.category, p.changes_requested,
                 p.changed_since_sync, p.reviewers_json, p.source_branch, p.dest_branch, p.updated_on,
@@ -303,7 +416,7 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
                    AND substr(dest_sha, 1, length(p.dest_sha)) = p.dest_sha
                    ORDER BY started_at DESC LIMIT 1),
                 (SELECT count(*) FROM findings f WHERE f.run_id = rr.id AND f.validation = 'ok' AND f.kind = 'melhoria'),
-                p.comment_count
+                p.comment_count, r.provider, r.workspace
          FROM pull_requests p
          JOIN repositories r ON r.id = p.repository_id
          LEFT JOIN review_runs rr ON rr.id = (SELECT id FROM review_runs WHERE pr_id = p.id ORDER BY started_at DESC LIMIT 1)
@@ -315,7 +428,9 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
         .query_map([], |r| {
             let reviewers: Vec<bitbucket::sync::Reviewer> =
                 serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
-            let approved_by_me = me.as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
+            let provider: String = r.get(26)?;
+            let identity = if provider == "github" { &github_me } else { &me };
+            let approved_by_me = identity.as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
             let run_id: Option<String> = r.get(13)?;
             let reviewed: Option<String> = r.get(21)?;
             let current: String = r.get(22)?;
@@ -323,6 +438,8 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
             Ok(PrView {
                 id: r.get(0)?,
                 repo: r.get(1)?,
+                provider,
+                owner: r.get(27)?,
                 bb_id: r.get(2)?,
                 title: r.get(3)?,
                 url: r.get(4)?,
@@ -627,21 +744,25 @@ pub struct CheckoutResult {
 /// Recusa se houver alteração não commitada ou se a branch local divergiu.
 #[tauri::command]
 pub async fn checkout_pr(state: State<'_, AppState>, pr_id: i64) -> AppResult<CheckoutResult> {
-    let (slug, branch, sha, root) = {
+    let (slug, mut branch, sha, root, provider, number, owner) = {
         let conn = state.conn()?;
-        let (slug, branch, sha): (String, String, String) = conn.query_row(
-            "SELECT r.slug, p.source_branch, p.source_sha FROM pull_requests p
+        let (slug, branch, sha, provider, number, owner): (String, String, String, String, i64, String) = conn.query_row(
+            "SELECT r.slug, p.source_branch, p.source_sha, r.provider, p.bb_id, r.workspace FROM pull_requests p
              JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
             [pr_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-        (slug, branch, sha, review::repos_root(&conn)?)
+        (slug, branch, sha, review::repos_root(&conn)?, provider, number, owner)
     };
-    let repo = root.join(&slug);
+    let repo = if provider == "github" { github::clone_path(&root, &owner, &slug) } else { root.join(&slug) };
     if !repo.join(".git").exists() {
         return Err(AppError::Invalid(format!("não achei o clone de {slug} em {}", repo.display())));
     }
-    let head = review::git::checkout_synced(&repo, &slug, &branch).await?;
+    let head = if provider == "github" {
+        let (local, head) = review::git::checkout_github(&repo, number).await?;
+        branch = local;
+        head
+    } else { review::git::checkout_synced(&repo, &slug, &branch).await? };
     Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: slug, branch, head })
 }
 

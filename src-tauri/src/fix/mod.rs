@@ -97,6 +97,9 @@ fn run_dir_of(host: &Host, fix_id: &str) -> PathBuf {
 #[derive(Clone)]
 struct Target {
     kind: &'static str,
+    provider: String,
+    owner: String,
+    source_repo: String,
     pr_id: Option<i64>,
     slug: String,
     bb_id: i64,
@@ -208,19 +211,24 @@ fn load_session(conn: &Connection, fix_id: &str) -> AppResult<SessionRow> {
     .ok_or_else(|| AppError::Invalid("correção não encontrada".into()))
     .and_then(|mut s| {
         s.jira_site = review::jira_site(conn)?;
+        if s.jira_site.is_none() { s.card_key = None; }
         Ok(s)
     })
 }
 
 fn load_pr_target(conn: &Connection, pr_id: i64) -> AppResult<(Target, String)> {
     conn.query_row(
-        "SELECT r.slug, p.bb_id, p.title, p.source_branch, p.dest_branch, p.category
+        "SELECT r.slug, p.bb_id, p.title, p.source_branch, p.dest_branch, p.category,
+                r.provider, r.workspace, ifnull(p.source_repo, '')
          FROM pull_requests p JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
         [pr_id],
         |r| {
             Ok((
                 Target {
                     kind: "pr",
+                    provider: r.get(6)?,
+                    owner: r.get(7)?,
+                    source_repo: r.get(8)?,
                     pr_id: Some(pr_id),
                     slug: r.get(0)?,
                     bb_id: r.get(1)?,
@@ -243,6 +251,9 @@ fn target_of(conn: &Connection, s: &SessionRow) -> AppResult<Target> {
             let branch = s.branch.clone().unwrap_or_default();
             Ok(Target {
                 kind: "branch",
+                provider: "local".into(),
+                owner: String::new(),
+                source_repo: String::new(),
                 pr_id: None,
                 slug: s.repo_slug.clone().unwrap_or_default(),
                 bb_id: 0,
@@ -261,6 +272,15 @@ fn repo_of(conn: &Connection, slug: &str) -> AppResult<PathBuf> {
             "não achei o clone local de {slug} em {} (ajuste a pasta dos repositórios nas Configurações)",
             repo.display()
         )));
+    }
+    Ok(repo)
+}
+
+fn repo_of_target(conn: &Connection, t: &Target) -> AppResult<PathBuf> {
+    if t.provider != "github" { return repo_of(conn, &t.slug); }
+    let repo = crate::github::clone_path(&review::repos_root(conn)?, &t.owner, &t.slug);
+    if !repo.join(".git").exists() {
+        return Err(AppError::Invalid(format!("clone GitHub {}/{} não encontrado em {}", t.owner, t.slug, repo.display())));
     }
     Ok(repo)
 }
@@ -651,7 +671,7 @@ pub fn start(host: Host, pr_id: i64, force: bool) -> AppResult<(String, Running)
         if category == "review_requested" {
             return Err(AppError::Invalid("a correção de comentários é só para PRs que você abriu".into()));
         }
-        let repo = repo_of(&conn, &target.slug)?;
+        let repo = repo_of_target(&conn, &target)?;
         let prev = previous(&conn, latest_pr_id(&conn, pr_id)?)?;
         (target, repo, prev)
     };
@@ -679,7 +699,7 @@ pub fn refresh(host: Host, fix_id: String) -> AppResult<Running> {
     let (s, t, repo) = with_db(&host, |c| {
         let s = load_session(c, &fix_id)?;
         let t = target_of(c, &s)?;
-        let repo = repo_of(c, &t.slug)?;
+        let repo = repo_of_target(c, &t)?;
         Ok((s, t, repo))
     })?;
     if t.kind != "pr" || s.status != "ready" {
@@ -725,7 +745,7 @@ pub fn analyze(host: Host, comment_ids: Vec<i64>) -> AppResult<Option<Running>> 
             return Err(AppError::Invalid("o worktree desta correção sumiu; busque os comentários de novo".into()));
         }
         let t = target_of(c, &s)?;
-        let repo = repo_of(c, &t.slug)?;
+        let repo = repo_of_target(c, &t)?;
         let mut queued = 0;
         for id in &comment_ids {
             queued += c.execute(
@@ -781,8 +801,8 @@ fn create_session(host: &Host, t: &Target) -> AppResult<String> {
     let fix_id = new_id();
     let run_dir = state.db_path.parent().unwrap().join("fixes").join(&fix_id);
     std::fs::create_dir_all(&run_dir)?;
-    let card = review::card_key(&t.branch, &t.title);
     let conn = state.db.lock().map_err(|_| db_err())?;
+    let card = review::configured_jira_key(&conn, &t.branch, &t.title)?;
     conn.execute(
         "INSERT INTO fix_sessions (id, kind, pr_id, repo_slug, branch, base_branch, run_dir, card_key, status, stage)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'analyzing', 'preparando')",
@@ -822,7 +842,8 @@ async fn client(host: &Host) -> AppResult<(Client, String, String)> {
 /// escolhe quais o Claude analisa).
 async fn prepare_pr(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc<RunCtl>) -> AppResult<()> {
     set_stage(host, fix_id, t, "buscando o código da branch (git fetch)");
-    let (src, _) = review::fresh_tips(repo, &t.branch, &t.base).await?;
+    let (src, _) = if t.provider == "github" { review::github_tips(repo, t.bb_id, &t.base).await? }
+        else { review::fresh_tips(repo, &t.branch, &t.base).await? };
     let s = with_db(host, |c| load_session(c, fix_id))?;
     git::run(repo, &["worktree", "add", "--detach", &s.wt().display().to_string(), &src]).await?;
     with_db(host, |c| Ok(c.execute("UPDATE fix_sessions SET base_sha = ?1 WHERE id = ?2", params![src, fix_id])?))?;
@@ -836,9 +857,21 @@ async fn prepare_pr(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc
 
 /// Threads abertas do PR que ainda não estão na correção → itens 'new'. Devolve quantas entraram.
 async fn add_threads(host: &Host, fix_id: &str, t: &Target, ctl: &RunCtl) -> AppResult<usize> {
-    set_stage(host, fix_id, t, "buscando os comentários no Bitbucket");
-    let (client, ws, me) = client(host).await?;
-    let threads = comments::open_threads(&client, &ws, &t.slug, t.bb_id, &me).await?;
+    set_stage(host, fix_id, t, "buscando os comentários da PR");
+    let threads = if t.provider == "github" {
+        let (mode, me) = with_db(host, |c| {
+            let mode = crate::db::get_setting(c, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into());
+            let me = crate::db::get_setting(c, "github.me")?.and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| AppError::Invalid("atualize a lista de PRs do GitHub primeiro".into()))?;
+            Ok((mode, me))
+        })?;
+        let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
+        let api = crate::github::Api::new(token)?;
+        crate::github::open_threads(&api, &t.owner, &t.slug, t.bb_id, &me).await?
+    } else {
+        let (client, ws, me) = client(host).await?;
+        comments::open_threads(&client, &ws, &t.slug, t.bb_id, &me).await?
+    };
     check(ctl)?;
     with_db(host, |c| {
         let mut added = 0;
@@ -942,7 +975,7 @@ pub async fn add_findings(host: Host, run_id: String, seqs: Vec<i64>) -> AppResu
         let latest = latest_branch_id(&conn, &slug, &branch)?;
         (slug, branch, base.unwrap_or_else(|| "dev".into()), repo, latest)
     };
-    let t = Target { kind: "branch", pr_id: None, slug, bb_id: 0, title: branch.clone(), branch: branch.clone(), base };
+    let t = Target { kind: "branch", provider: "local".into(), owner: String::new(), source_repo: String::new(), pr_id: None, slug, bb_id: 0, title: branch.clone(), branch: branch.clone(), base };
     let tip = git::run(&repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}^{{commit}}")])
         .await
         .map_err(|_| AppError::Invalid(format!("a branch {branch} não existe mais no clone")))?;
@@ -1102,10 +1135,10 @@ fn release(host: &Host, fix_id: &str, t: &Target, repo: &Path) {
 
 // ---------------- fila: o agente confere os itens ----------------
 
-fn analyzer_opts(run_dir: &Path, schema: &str) -> AppResult<Vec<String>> {
+fn analyzer_opts(run_dir: &Path, schema: &str, jira: bool) -> AppResult<Vec<String>> {
     let related = related_dir(run_dir);
     let mut allowed = review::READ_ONLY_TOOLS.replace("Agent ", "");
-    allowed.push_str(" ToolSearch mcp__atlassian__getJiraIssue");
+    if jira { allowed.push_str(" ToolSearch mcp__atlassian__getJiraIssue"); }
     let mut opts: Vec<String> = vec![
         "--agent".into(), "comment-fixer".into(), "--agents".into(), review::agents_json(&["comment-fixer"])?,
         "--model".into(), "sonnet".into(), "--effort".into(), "medium".into(),
@@ -1118,7 +1151,7 @@ fn analyzer_opts(run_dir: &Path, schema: &str) -> AppResult<Vec<String>> {
         opts.extend(["--add-dir".into(), related.display().to_string()]);
     }
     // sem cache de 5 min: a conversa sobre os itens pode vir bem depois da análise
-    opts.extend(review::worker_config(false, true));
+    opts.extend(review::worker_config(false, jira));
     opts.extend(review::writing_style_opts());
     Ok(opts)
 }
@@ -1219,7 +1252,7 @@ async fn run_queue(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc<
             ),
             None => (Session::New(uuid::Uuid::new_v4().to_string()), first_prompt(t, &s, &wt, &items_file, repo).await),
         };
-        let mut opts = analyzer_opts(&s.run_dir, "fix-analysis.json")?;
+        let mut opts = analyzer_opts(&s.run_dir, "fix-analysis.json", s.card_key.is_some())?;
         opts.extend(["--max-turns".into(), "80".into(), "--max-budget-usd".into(), "3".into()]);
         let spec = Spec {
             session: session.clone(),
@@ -1340,7 +1373,7 @@ pub async fn discard(host: Host, fix_id: String) -> AppResult<()> {
     let (s, t, repo) = with_db(&host, |c| {
         let s = load_session(c, &fix_id)?;
         let t = target_of(c, &s)?;
-        let repo = repo_of(c, &t.slug)?;
+        let repo = repo_of_target(c, &t)?;
         Ok((s, t, repo))
     })?;
     if matches!(s.status.as_str(), "committed" | "pushed") {
@@ -1480,7 +1513,7 @@ pub fn ask(host: Host, comment_id: i64, text: String) -> AppResult<Running> {
             }
             Ok(())
         });
-        match with_db(&host, |c| repo_of(c, &t.slug)) {
+        match with_db(&host, |c| repo_of_target(c, &t)) {
             Ok(repo) => release(&host, &fix_id, &t, &repo),
             Err(_) => {
                 host.state().reviews.lock().unwrap().remove(&key(&fix_id));
@@ -1533,7 +1566,7 @@ async fn turn(
         author = c.author.clone().unwrap_or_default(),
         situation = status_text(&c.status, c.applied_at.is_some()),
     );
-    let mut opts = analyzer_opts(&s.run_dir, "fix-turn.json")?;
+    let mut opts = analyzer_opts(&s.run_dir, "fix-turn.json", s.card_key.is_some())?;
     opts.extend(["--max-turns".into(), "40".into(), "--max-budget-usd".into(), "1.5".into()]);
     let spec = Spec {
         session: Session::Resume(session_id.to_owned()),
@@ -1604,7 +1637,7 @@ pub fn commit(host: Host, fix_id: String) -> AppResult<Running> {
         let conn = state.db.lock().map_err(|_| db_err())?;
         let s = load_session(&conn, &fix_id)?;
         let t = target_of(&conn, &s)?;
-        let repo = repo_of(&conn, &t.slug)?;
+        let repo = repo_of_target(&conn, &t)?;
         let mut stmt = conn.prepare(
             "SELECT seq, ifnull(author, ''), ifnull(path, ''), line, body, ifnull(explanation, ''), status, applied_at IS NOT NULL
              FROM fix_comments WHERE fix_id = ?1 ORDER BY seq",
@@ -1717,8 +1750,16 @@ async fn commit_and_finish(
     let short = &sha[..sha.len().min(10)];
     check(&ctl)?;
     if t.kind == "pr" {
-        set_stage(host, fix_id, t, &format!("push para origin/{}", t.branch));
-        git::run(&wt, &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)]).await.map_err(|e| {
+        set_stage(host, fix_id, t, &format!("push para {}", t.branch));
+        let pushed = if t.provider == "github" {
+            let mode = with_db(host, |c| Ok(crate::db::get_setting(c, "github.auth_mode")?
+                .and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())))?;
+            let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
+            crate::github::push(&wt, &t.source_repo, &t.branch, &token).await
+        } else {
+            git::run(&wt, &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)]).await.map(|_| ())
+        };
+        pushed.map_err(|e| {
             AppError::Invalid(format!(
                 "o push foi recusado; o commit {short} continua no worktree e o botão tenta de novo. \
                  Se a branch recebeu commits no remoto, comece uma análise nova. {e}"
@@ -1843,7 +1884,7 @@ pub async fn push_branch(host: Host, fix_id: String) -> AppResult<()> {
     let (s, t, repo) = with_db(&host, |c| {
         let s = load_session(c, &fix_id)?;
         let t = target_of(c, &s)?;
-        let repo = repo_of(c, &t.slug)?;
+        let repo = repo_of_target(c, &t)?;
         Ok((s, t, repo))
     })?;
     if t.kind != "branch" || s.status != "committed" {

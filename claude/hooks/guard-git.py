@@ -8,7 +8,8 @@ import json, re, shlex, sys
 
 # Subcomandos que gravam histórico ou mexem no remoto: sempre negados.
 ALWAYS = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "am",
-          "update-ref", "tag", "notes", "pull", "filter-branch", "replace"}
+          "update-ref", "tag", "notes", "pull", "filter-branch", "replace",
+          "clean", "add", "rm", "mv", "config", "apply", "stash", "gc", "prune"}
 # Subcomandos que só são negados quando envolvem uma branch protegida.
 WITH_PROTECTED = {"checkout", "switch", "reset", "branch", "worktree", "restore"}
 PROTECTED = re.compile(
