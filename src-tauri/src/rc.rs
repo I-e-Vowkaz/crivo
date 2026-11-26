@@ -1,9 +1,8 @@
 //! Envio do pedido de mudanças (RC) que o agente `rc-validator` montou no fim do review.
 //!
-//! Só GitHub: um review com um comentário por linha e o resumo do agente no corpo. Com algum item
+//! Só onde o Crivo escreve (GitHub, `Provider::publish`): um review com um comentário por linha e o resumo do agente no corpo. Com algum item
 //! bloqueante o evento é `REQUEST_CHANGES`; só com sugestões, `COMMENT`. O revisor pode tirar itens
 //! antes de enviar (`skip`). Nada sai sem o clique do revisor.
-use reqwest::Method;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -11,7 +10,7 @@ use tauri::State;
 
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
-use crate::github;
+use crate::hosting::{Provider, RepoRef};
 
 #[derive(Serialize)]
 pub struct RcSent {
@@ -23,8 +22,7 @@ pub struct RcSent {
 
 #[derive(Debug)]
 struct Plan {
-    owner: String,
-    repo: String,
+    repo: RepoRef,
     number: i64,
     sha: String,
     event: &'static str,
@@ -53,20 +51,9 @@ fn item_text(decision: &str, body: &str) -> String {
 
 /// Monta o review a partir do que o agente decidiu. Erro quando não há o que enviar.
 fn plan(conn: &Connection, run_id: &str, skip: &[i64]) -> AppResult<Plan> {
-    let (provider, owner, repo, number, sha, rc_status, summary): (String, String, String, i64, String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT pvd.provider, pvd.workspace, pvd.slug, p.bb_id, rr.source_sha, rr.rc_status, rr.rc_summary
-             FROM review_runs rr JOIN pull_requests p ON p.id = rr.pr_id
-             JOIN repositories pvd ON pvd.id = p.repository_id
-             WHERE rr.id = ?1 AND rr.status = 'completed'",
-            [run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-        )
-        .optional()?
-        .ok_or_else(|| AppError::Invalid("review concluído não encontrado".into()))?;
-    if provider != "github" {
-        return Err(AppError::Invalid("o pedido de mudanças só vai para PRs do GitHub".into()));
-    }
+    let (repo, number, sha) = crate::publish::writable_target(conn, run_id)?;
+    let (rc_status, summary): (Option<String>, Option<String>) =
+        conn.query_row("SELECT rc_status, rc_summary FROM review_runs WHERE id = ?1", [run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     if rc_status.as_deref() != Some("completed") {
         return Err(AppError::Invalid("este review não tem pedido de mudanças montado".into()));
     }
@@ -111,66 +98,28 @@ fn plan(conn: &Connection, run_id: &str, skip: &[i64]) -> AppResult<Plan> {
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
     .join("\n\n");
-    Ok(Plan { owner, repo, number, sha, event: if blocking { "REQUEST_CHANGES" } else { "COMMENT" }, body, inline, seqs, marker })
+    Ok(Plan { repo, number, sha, event: if blocking { "REQUEST_CHANGES" } else { "COMMENT" }, body, inline, seqs, marker })
 }
 
 #[tauri::command]
 pub async fn send_request_changes(state: State<'_, AppState>, run_id: String, skip: Vec<i64>) -> AppResult<RcSent> {
     let _lock = state.publish_lock.lock().await;
-    let (plan, mode, sent) = {
+    let (plan, sent) = {
         let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
         let sent: Option<String> = conn
             .query_row("SELECT rc_sent_url FROM review_runs WHERE id = ?1", [&run_id], |r| r.get(0))
             .optional()?
             .flatten();
-        let mode = crate::db::get_setting(&conn, "github.auth_mode")?
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "gh".into());
-        (plan(&conn, &run_id, &skip)?, mode, sent)
+        (plan(&conn, &run_id, &skip)?, sent)
     };
     if let Some(url) = sent {
         return Err(AppError::Invalid(format!("o pedido de mudanças deste review já foi enviado: {url}")));
     }
-    let api = github::Api::new(github::token(&mode, state.secrets.as_ref()).await?)?;
-    let (owner, repo, number) = (&plan.owner, &plan.repo, plan.number);
-    let current: Value = api.get(&format!("/repos/{owner}/{repo}/pulls/{number}")).await?;
-    if current.get("state").and_then(Value::as_str) != Some("open") {
-        return Err(AppError::Invalid("a PR já não está aberta".into()));
-    }
-    if current.pointer("/head/sha").and_then(Value::as_str) != Some(plan.sha.as_str()) {
-        return Err(AppError::Invalid("a PR recebeu novos commits; revise novamente antes de pedir mudanças".into()));
-    }
-    // um envio anterior que chegou ao GitHub mas não foi gravado aqui: reaproveita, sem duplicar
-    let me: github::User = api.get("/user").await?;
-    let mut prior: Option<Value> = None;
-    for page in 1..=100 {
-        let reviews: Vec<Value> = api.get(&format!("/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100&page={page}")).await?;
-        let last = reviews.len() < 100;
-        prior = reviews.into_iter().find(|r| {
-            r.pointer("/user/login").and_then(Value::as_str) == Some(me.login.as_str())
-                && r.get("body").and_then(Value::as_str).is_some_and(|b| b.contains(&plan.marker))
-        });
-        if prior.is_some() || last {
-            break;
-        }
-    }
-    let response: Value = match prior {
-        Some(p) => p,
-        None => {
-            api.request(
-                Method::POST,
-                &format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
-                Some(&json!({"commit_id": plan.sha, "event": plan.event, "body": plan.body, "comments": plan.inline})),
-            )
-            .await?
-        }
-    };
-    let remote = response
-        .get("id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| AppError::Invalid("GitHub não devolveu ID do review".into()))?
-        .to_string();
-    let url = response.get("html_url").and_then(Value::as_str).map(str::to_owned);
+    // confere PR aberta e no commit revisado, e reaproveita um envio anterior com o mesmo marcador
+    let provider = Provider::connect(plan.repo.kind, &state.db, state.secrets.as_ref()).await?;
+    let (remote, url) = provider
+        .publish(&plan.repo, plan.number, &plan.sha, &plan.body, &plan.marker, &plan.inline, plan.event == "REQUEST_CHANGES")
+        .await?;
     let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
     for seq in &plan.seqs {
         conn.execute(
@@ -221,7 +170,7 @@ mod tests {
         let p = plan(&seed("github", "completed"), "r1", &[]).unwrap();
         assert_eq!(p.event, "REQUEST_CHANGES");
         assert_eq!(p.seqs, vec![2, 4, 1], "bloqueantes primeiro, sem o item fora");
-        assert_eq!((p.owner.as_str(), p.repo.as_str(), p.number, p.sha.as_str()), ("acme", "app", 7, "abc"));
+        assert_eq!((p.repo.label(p.number), p.sha.as_str()), ("acme/app#7".to_owned(), "abc"));
         let paths: Vec<&str> = p.inline.iter().map(|c| c["path"].as_str().unwrap()).collect();
         assert_eq!(paths, vec!["b.php", "a.php"], "fora do diff não vira comentário de linha");
         assert_eq!(p.inline[0]["body"], "**Bloqueante.** filtra pelo tenant");
@@ -246,7 +195,7 @@ mod tests {
 
     #[test]
     fn so_github_e_so_com_rc_montado() {
-        assert_eq!(plan(&seed("bitbucket", "completed"), "r1", &[]).unwrap_err().to_string(), "o pedido de mudanças só vai para PRs do GitHub");
+        assert_eq!(plan(&seed("bitbucket", "completed"), "r1", &[]).unwrap_err().to_string(), "o Crivo não escreve no Bitbucket");
         assert_eq!(plan(&seed("github", "failed"), "r1", &[]).unwrap_err().to_string(), "este review não tem pedido de mudanças montado");
     }
 }

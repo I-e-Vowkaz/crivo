@@ -1,0 +1,314 @@
+//! Provedores de git hosting (Bitbucket e GitHub).
+//!
+//! `Kind` e `RepoRef` resolvem o que depende do provedor sem falar com a API (caminho do clone,
+//! rótulo, filtro da CLI, refs do git). Os chamadores não comparam o texto do provedor: perguntam
+//! a estes tipos.
+
+mod provider;
+pub use provider::Provider;
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{AppError, AppResult};
+use crate::review::{self, git};
+
+/// Provedor de um repositório; o texto é o gravado em `repositories.provider`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Bitbucket,
+    Github,
+}
+
+impl Kind {
+    pub fn parse(s: &str) -> Option<Kind> {
+        match s {
+            "bitbucket" => Some(Kind::Bitbucket),
+            "github" => Some(Kind::Github),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Bitbucket => "bitbucket",
+            Kind::Github => "github",
+        }
+    }
+
+    /// Nome para mensagens ("Bitbucket", "GitHub").
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Bitbucket => "Bitbucket",
+            Kind::Github => "GitHub",
+        }
+    }
+
+    /// O Crivo só escreve (comentários, pedido de mudança) onde o provedor permite: o Bitbucket é
+    /// só leitura por decisão do projeto.
+    pub fn can_write(self) -> bool {
+        matches!(self, Kind::Github)
+    }
+}
+
+/// Um repositório de um provedor: `owner` é o workspace no Bitbucket e o dono no GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRef {
+    pub kind: Kind,
+    pub owner: String,
+    pub slug: String,
+}
+
+impl RepoRef {
+    pub fn new(provider: &str, owner: impl Into<String>, slug: impl Into<String>) -> AppResult<RepoRef> {
+        let kind = Kind::parse(provider).ok_or_else(|| AppError::Invalid(format!("provedor desconhecido: {provider}")))?;
+        let (owner, slug) = (owner.into(), slug.into());
+        // viram pedaços de caminho (clone em `<root>/<owner>/<slug>`): um componente só
+        let single = |s: &str| {
+            let mut c = Path::new(s).components();
+            matches!((c.next(), c.next()), (Some(std::path::Component::Normal(_)), None)) && !s.starts_with('.')
+        };
+        if !single(&owner) || !single(&slug) {
+            return Err(AppError::Invalid(format!("repositório inválido: {owner}/{slug}")));
+        }
+        Ok(RepoRef { kind, owner, slug })
+    }
+
+    /// Para os `query_map`: as colunas `repositories.provider`, `workspace` e `slug`.
+    pub fn from_row(provider: &str, owner: String, slug: String) -> rusqlite::Result<RepoRef> {
+        RepoRef::new(provider, owner, slug).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e.to_string())))
+        })
+    }
+
+    /// Clone local: `<root>/<slug>`; no GitHub, `<root>/<owner>/<slug>` quando existe.
+    pub fn clone_path(&self, root: &Path) -> PathBuf {
+        if self.kind == Kind::Github {
+            let nested = root.join(&self.owner).join(&self.slug);
+            if nested.join(".git").exists() {
+                return nested;
+            }
+        }
+        root.join(&self.slug)
+    }
+
+    /// O clone local, conferido: existe e o `origin` dele é este repositório. Sem a conferência, um
+    /// `<root>/<slug>` de outro dono (ou do outro provedor) seria revisado no lugar deste.
+    pub fn clone_dir(&self, root: &Path) -> AppResult<PathBuf> {
+        let dir = self.clone_path(root);
+        if !dir.join(".git").exists() {
+            return Err(AppError::Invalid(format!(
+                "não achei o clone local de {}/{} em {} (ajuste a pasta dos repositórios nas Configurações)",
+                self.owner,
+                self.slug,
+                dir.display()
+            )));
+        }
+        let out = std::process::Command::new("git").arg("-C").arg(&dir).args(["remote", "get-url", "origin"]).output()?;
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !out.status.success() || !origin_matches(&url, &self.owner, &self.slug) {
+            return Err(AppError::Invalid(format!(
+                "o clone em {} aponta para {}, não para {}/{} no {}",
+                dir.display(),
+                if url.is_empty() { "nenhum origin" } else { &url },
+                self.owner,
+                self.slug,
+                self.kind.name()
+            )));
+        }
+        Ok(dir)
+    }
+
+    /// `slug#N` no Bitbucket, `owner/slug#N` no GitHub.
+    pub fn label(&self, number: i64) -> String {
+        match self.kind {
+            Kind::Bitbucket => format!("{}#{number}", self.slug),
+            Kind::Github => format!("{}/{}#{number}", self.owner, self.slug),
+        }
+    }
+
+    /// Filtro `--repo` da CLI: o slug, ou `owner/slug` no GitHub.
+    pub fn matches(&self, filter: &str) -> bool {
+        filter == self.slug || (self.kind == Kind::Github && filter == format!("{}/{}", self.owner, self.slug))
+    }
+
+    /// Ref da ponta do PR no clone, depois do último sync (aba Diff).
+    pub fn head_ref(&self, number: i64, src_branch: &str) -> String {
+        match self.kind {
+            Kind::Bitbucket => format!("origin/{src_branch}"),
+            Kind::Github => format!("origin/pr/{number}"),
+        }
+    }
+
+    /// Busca agora as pontas de origem e destino do PR e devolve os dois SHAs.
+    pub async fn fetch_tips(&self, repo: &Path, number: i64, src: &str, dest: &str) -> AppResult<(String, String)> {
+        match self.kind {
+            Kind::Bitbucket => review::fresh_tips(repo, src, dest).await,
+            Kind::Github => review::github_tips(repo, number, dest).await,
+        }
+    }
+
+    /// Checkout do PR no clone do usuário, sem rede no Bitbucket. Devolve a branch local e o SHA.
+    pub async fn checkout(&self, repo: &Path, number: i64, branch: &str) -> AppResult<(String, String)> {
+        match self.kind {
+            Kind::Bitbucket => Ok((branch.to_owned(), git::checkout_synced(repo, &self.slug, branch).await?)),
+            Kind::Github => git::checkout_github(repo, number).await,
+        }
+    }
+}
+
+/// O `origin` termina em `owner/slug` (com ou sem `.git`), sem diferenciar maiúsculas. O host
+/// não entra: o clone pode usar um apelido de ssh (`git@bitbucket-trabalho:ws/app.git`).
+fn origin_matches(url: &str, owner: &str, slug: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url).to_lowercase();
+    let mut parts = url.rsplit(['/', ':']);
+    let (Some(s), Some(o)) = (parts.next(), parts.next()) else { return false };
+    s == slug.to_lowercase() && o == owner.to_lowercase()
+}
+
+/// Quem eu sou no provedor, gravado no último sync: o `uuid` no Bitbucket e o `login` no GitHub
+/// (é o que vai em `reviewers_json[].uuid`).
+pub fn me(conn: &rusqlite::Connection, kind: Kind) -> AppResult<Option<String>> {
+    let (key, field) = match kind {
+        Kind::Bitbucket => ("bitbucket.me", "uuid"),
+        Kind::Github => ("github.me", "login"),
+    };
+    Ok(crate::db::get_setting(conn, key)?.and_then(|v| v.get(field).and_then(serde_json::Value::as_str).map(str::to_owned)))
+}
+
+/// Resultado do sync de um repositório.
+#[derive(Debug, Serialize)]
+pub struct RepoSync {
+    pub slug: String,
+    pub open: usize,
+    pub error: Option<String>,
+    /// `git fetch --prune` no clone local (traz as branches novas para o Checkout).
+    pub fetch_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResult {
+    pub user: String,
+    pub repos: Vec<RepoSync>,
+    pub requests: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Reply {
+    pub author: String,
+    pub body: String,
+    pub created_on: Option<String>,
+}
+
+/// Uma thread de comentário que ainda pede resposta.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Thread {
+    pub id: i64,
+    pub author: String,
+    pub body: String,
+    /// Comentário em linha: arquivo e linha (do lado novo; do antigo se a linha foi removida).
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    /// O código comentado mudou depois do comentário.
+    pub outdated: bool,
+    pub url: Option<String>,
+    pub created_on: Option<String>,
+    pub replies: Vec<Reply>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_ida_e_volta() {
+        assert_eq!(Kind::parse("github"), Some(Kind::Github));
+        assert_eq!(Kind::parse("bitbucket"), Some(Kind::Bitbucket));
+        assert_eq!(Kind::Bitbucket.as_str(), "bitbucket");
+        assert_eq!(Kind::parse("gitlab"), None);
+        assert!(!Kind::Bitbucket.can_write() && Kind::Github.can_write());
+        assert_eq!(serde_json::to_value(Kind::Github).unwrap(), "github");
+    }
+
+    #[test]
+    fn rotulo_e_filtro() {
+        let bb = RepoRef::new("bitbucket", "acme", "app").unwrap();
+        let gh = RepoRef::new("github", "acme", "app").unwrap();
+        assert_eq!(bb.label(7), "app#7");
+        assert_eq!(gh.label(7), "acme/app#7");
+        assert!(bb.matches("app") && !bb.matches("acme/app"));
+        assert!(gh.matches("app") && gh.matches("acme/app") && !gh.matches("outro/app"));
+    }
+
+    #[test]
+    fn head_ref_por_provedor() {
+        assert_eq!(RepoRef::new("bitbucket", "a", "r").unwrap().head_ref(3, "PROJ-1"), "origin/PROJ-1");
+        assert_eq!(RepoRef::new("github", "a", "r").unwrap().head_ref(3, "PROJ-1"), "origin/pr/3");
+    }
+
+    #[test]
+    fn clone_do_github_prefere_owner_repo() {
+        let root = std::env::temp_dir().join(format!("crivo-hosting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let gh = RepoRef::new("github", "acme", "app").unwrap();
+        let bb = RepoRef::new("bitbucket", "acme", "app").unwrap();
+        assert_eq!(gh.clone_path(&root), root.join("app"));
+        std::fs::create_dir_all(root.join("acme/app/.git")).unwrap();
+        assert_eq!(gh.clone_path(&root), root.join("acme/app"));
+        assert_eq!(bb.clone_path(&root), root.join("app"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn nome_que_sai_da_pasta_e_erro() {
+        for (owner, slug) in [("acme", "../x"), ("acme", "a/b"), ("..", "app"), ("acme", ".git"), ("", "app"), ("acme", "")] {
+            assert!(RepoRef::new("github", owner, slug).is_err(), "{owner}/{slug}");
+        }
+        assert!(RepoRef::new("bitbucket", "acme", "acme-back").is_ok());
+    }
+
+    #[test]
+    fn minha_identidade_por_provedor() {
+        let conn = crate::db::open_in_memory().unwrap();
+        assert_eq!(me(&conn, Kind::Github).unwrap(), None);
+        crate::db::set_setting(&conn, "bitbucket.me", &serde_json::json!({"uuid": "{u1}", "display_name": "Eu"})).unwrap();
+        crate::db::set_setting(&conn, "github.me", &serde_json::json!({"login": "eu", "id": 7})).unwrap();
+        assert_eq!(me(&conn, Kind::Bitbucket).unwrap().as_deref(), Some("{u1}"));
+        assert_eq!(me(&conn, Kind::Github).unwrap().as_deref(), Some("eu"));
+    }
+
+    #[test]
+    fn origin_do_mesmo_repositorio() {
+        assert!(origin_matches("git@github.com:acme/app.git", "acme", "app"));
+        assert!(origin_matches("https://github.com/acme/app/", "acme", "app"));
+        assert!(origin_matches("https://eu@bitbucket.org/ws/app.git\n", "ws", "app"));
+        assert!(origin_matches("git@bitbucket-trabalho:WS/App.git", "ws", "app"), "apelido de ssh e maiúsculas");
+        assert!(!origin_matches("git@github.com:outro/app.git", "acme", "app"));
+        assert!(!origin_matches("git@github.com:acme/app-front.git", "acme", "app"));
+    }
+
+    #[test]
+    fn clone_de_outro_repositorio_e_recusado() {
+        let root = std::env::temp_dir().join(format!("crivo-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@github.com:acme/app.git"]);
+        assert_eq!(RepoRef::new("github", "acme", "app").unwrap().clone_dir(&root).unwrap(), dir);
+        let outro = RepoRef::new("github", "outro", "app").unwrap().clone_dir(&root).unwrap_err().to_string();
+        assert!(outro.contains("aponta para git@github.com:acme/app.git"), "{outro}");
+        assert!(RepoRef::new("bitbucket", "ws", "app").unwrap().clone_dir(&root).is_err(), "clone plano do GitHub no lugar do Bitbucket");
+        assert!(RepoRef::new("github", "acme", "nada").unwrap().clone_dir(&root).unwrap_err().to_string().contains("não achei o clone"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn provedor_desconhecido_e_erro() {
+        assert!(RepoRef::new("gitlab", "a", "r").is_err());
+    }
+}

@@ -174,8 +174,8 @@ pub type Registry = Mutex<HashMap<String, Arc<RunCtl>>>;
 
 #[derive(Debug, Clone)]
 pub struct PrForReview {
-    pub provider: String,
-    pub owner: String,
+    /// Repositório do PR no provedor; `None` na branch local.
+    pub repo: Option<crate::hosting::RepoRef>,
     pub slug: String,
     pub bb_id: i64,
     pub title: String,
@@ -199,8 +199,7 @@ fn load_pr(conn: &Connection, pr_id: i64) -> AppResult<PrForReview> {
         [pr_id],
         |r| {
             Ok(PrForReview {
-                provider: r.get(10)?,
-                owner: r.get(11)?,
+                repo: Some(crate::hosting::RepoRef::from_row(&r.get::<_, String>(10)?, r.get(11)?, r.get(0)?)?),
                 slug: r.get(0)?,
                 bb_id: r.get(1)?,
                 title: r.get(2)?,
@@ -453,8 +452,7 @@ pub async fn start_branch_run(host: Host, slug: String, branch: String) -> AppRe
         return Err(AppError::Invalid(format!("{branch} é a própria base do review")));
     }
     let pr = PrForReview {
-        provider: "local".into(),
-        owner: String::new(),
+        repo: None,
         slug,
         bb_id: 0,
         title: branch.clone(),
@@ -479,7 +477,7 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
     if git::is_protected(&pr.source_branch) {
         return Err(AppError::Invalid(format!("recusado: a branch de origem {} é protegida", pr.source_branch)));
     }
-    let repo = if pr.provider == "github" { crate::github::clone_path(root, &pr.owner, &pr.slug) } else { root.join(&pr.slug) };
+    let repo = match &pr.repo { Some(rr) => rr.clone_dir(root)?, None => root.join(&pr.slug) };
     if !repo.join(".git").exists() {
         return Err(AppError::Invalid(format!(
             "não achei o clone local de {} em {} (ajuste a pasta dos repositórios nas Configurações)",
@@ -511,7 +509,7 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
     let ctl = Arc::new(RunCtl::default());
     state.reviews.lock().unwrap().insert(run_id.clone(), ctl.clone());
     if let Host::Cli(cli) = &host {
-        let label = if pr.local { format!("{}:{}", pr.slug, pr.source_branch) } else { format!("{}#{}", pr.slug, pr.bb_id) };
+        let label = match &pr.repo { Some(rr) => rr.label(pr.bb_id), None => format!("{}:{}", pr.slug, pr.source_branch) };
         cli.labels.lock().unwrap().insert(run_id.clone(), label);
         // o app, ao abrir, não marca como interrompida a execução de um processo vivo
         std::fs::write(run_dir.join(CLI_PID_FILE), std::process::id().to_string())?;
@@ -752,9 +750,10 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
     ctx.stage("buscando o código do PR (git fetch)");
     // Sempre a ponta atual das branches, não o commit da última atualização da lista:
     // o PR pode ter recebido commits depois dela (PROJ-1503, 2026-11-18).
-    let (src, base) = if pr.local { local_tips(ctx, repo, pr).await? }
-        else if pr.provider == "github" { github_tips(repo, pr.bb_id, &pr.dest_branch).await? }
-        else { fresh_tips(repo, &pr.source_branch, &pr.dest_branch).await? };
+    let (src, base) = match &pr.repo {
+        None => local_tips(ctx, repo, pr).await?,
+        Some(rr) => rr.fetch_tips(repo, pr.bb_id, &pr.source_branch, &pr.dest_branch).await?,
+    };
     if !pr.local && !src.starts_with(&pr.source_sha) {
         ctx.log(&format!(
             "o PR recebeu commits depois da última atualização da lista: revisando {} (a lista tinha {})",
@@ -803,7 +802,7 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
     } else {
         format!(
             "# Contexto do PR ({})\n\n- PR: {}#{} — {}\n- Link: {}\n- Branch: `{}` → `{}`\n- Autor: {}\n- Chave do card: {}\n\n## Descrição do PR\n\n{}\n",
-            pr.provider,
+            pr.repo.as_ref().map_or("local", |r| r.kind.as_str()),
             pr.slug,
             pr.bb_id,
             pr.title,
@@ -815,22 +814,11 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
             if pr.description.trim().is_empty() { "(sem descrição)" } else { pr.description.as_str() }
         )
     };
-    if pr.provider == "github" {
-        let mode = {
-            let conn = ctx.state().db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-            crate::db::get_setting(&conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())
-        };
-        let token = crate::github::token(&mode, ctx.state().secrets.as_ref()).await?;
-        let api = crate::github::Api::new(token)?;
-        for (owner, repo_name, number) in crate::github::issue_refs(&format!("{} {}", pr.title, pr.description), &pr.owner, &pr.slug) {
-            let issue: serde_json::Value = match api.get(&format!("/repos/{owner}/{repo_name}/issues/{number}")).await {
-                Ok(issue) => issue,
-                Err(e) => { ctx.log(&format!("AVISO: não consegui ler a issue {owner}/{repo_name}#{number}: {e}")); continue; }
-            };
-            if issue.get("pull_request").is_some() { continue; }
-            card_text.push_str(&format!("\n## GitHub Issue {owner}/{repo_name}#{number}\n\n{}\n\n{}\n",
-                issue.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
-                issue.get("body").and_then(serde_json::Value::as_str).unwrap_or("")));
+    // contexto que só o provedor tem (as issues citadas no PR do GitHub); sem ele, o review segue
+    if let Some(rr) = &pr.repo {
+        match crate::hosting::Provider::connect(rr.kind, &ctx.state().db, ctx.state().secrets.as_ref()).await {
+            Ok(p) => card_text.push_str(&p.extra_context(rr, &pr.title, &pr.description, &|l| ctx.log(l)).await),
+            Err(e) => ctx.log(&format!("AVISO: sem o contexto extra do {}: {e}", rr.kind.name())),
         }
     }
     std::fs::write(&card_path, card_text)?;
@@ -967,8 +955,8 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
         save_cost(ctx, cost)?;
     }
 
-    // ---- pedido de mudanças (Sonnet `rc-validator`), só em PR do GitHub ----
-    if pr.provider == "github" && !pr.local {
+    // ---- pedido de mudanças (Sonnet `rc-validator`), só onde o Crivo escreve (GitHub) ----
+    if !pr.local && pr.repo.as_ref().is_some_and(|r| r.kind.can_write()) {
         cost += request_changes(ctx, wt, &src, &base, &card_path, &conventions).await?;
         save_cost(ctx, cost)?;
     }

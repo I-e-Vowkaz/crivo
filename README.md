@@ -7,7 +7,7 @@ App desktop em Tauri 2, com backend em Rust e interface em Vue 3. A interface e 
 ## O que faz
 
 - Lista os PRs abertos em que você está envolvido: os que você precisa revisar e os que você abriu, com quem pediu mudanças e quem aprovou.
-- Publica achados selecionados como comentários na PR. No GitHub, pode enviar um review com comentário ou pedido de mudanças; no Bitbucket, publica comentários.
+- No GitHub, publica os achados que você selecionar como um review na PR, com comentário ou pedido de mudanças. No Bitbucket o Crivo só lê: nada é publicado lá.
 - Revisa um PR sob demanda, num worktree separado no commit exato do PR. Seu checkout nunca é tocado.
   1. O Sonnet roda a skill `review-branch`, que lança o agente `branch-reviewer` e classifica cada achado por severidade.
   2. O app confere cada `arquivo:linha` no commit revisado.
@@ -26,7 +26,7 @@ App desktop em Tauri 2, com backend em Rust e interface em Vue 3. A interface e 
 
 - Linux. O código usa `/proc`, `~/.local/share` e o systemd do usuário; não há build para macOS nem Windows.
 - [Claude Code](https://code.claude.com/docs/en/overview) instalado e autenticado (`claude` no PATH). Para uso com token de execução, inicie o Crivo com `CLAUDE_CODE_OAUTH_TOKEN` no ambiente; o app repassa somente essa credencial ao processo do Claude.
-- Um API token do Bitbucket com `read:pullrequest`, `read:repository` e `read:user`. Para publicar, adicione `write:pullrequest`.
+- Um API token do Bitbucket só de leitura, com `read:pullrequest`, `read:repository` e `read:user`. O app recusa token com qualquer escopo de escrita.
 - Para GitHub.com, um token com acesso aos repositórios (Pull requests: escrita para publicar; Contents: escrita para push) ou o GitHub CLI `gh` autenticado.
 - Jira é opcional. Para ler seus cards, configure o site do Jira no app e o MCP do Atlassian no `~/.claude.json` com o nome `atlassian`. Sem Jira, o review usa o título e a descrição da PR e, no GitHub, as issues referenciadas.
 - Os repositórios clonados localmente em `<pasta>/<repo>`; para GitHub, também é aceito `<pasta>/<owner>/<repo>`. O `origin` do clone GitHub deve apontar para o repositório da PR.
@@ -68,12 +68,17 @@ pr-review-orchestrator --sync                 # só atualiza a lista de PRs
 
 Cada comando tem `--help`. Em `packaging/claude-skill/` há skills do Claude Code que chamam esses comandos, e em `packaging/systemd/` um timer que atualiza a lista todo dia.
 
+## Provedores (para quem mexe no código)
+
+Tudo que depende do Bitbucket ou do GitHub fica em `src-tauri/src/hosting/`. O `RepoRef` resolve o que não usa rede (caminho do clone, rótulo, filtro `--repo`, refs do git) e o `Provider::connect` é a factory que devolve o cliente autenticado (sync, comentários abertos, push da correção, contexto extra, publicação). O resto do app não compara o nome do provedor. Um provedor novo é uma variante a mais em `Kind` e em `Provider`, e o compilador aponta cada método que precisa tratá-la.
+
 ## Segurança
 
 - O review só lê. O hook `claude/hooks/guard-git.py` bloqueia commit, push, merge, rebase, tag e checkout ou reset de branch protegida.
 - O teste no navegador só navega em `localhost` e nos hosts configurados (`claude/hooks/guard-browser.py`), sem upload de arquivo.
 - Só o backend usa os tokens; os agentes recebem conteúdo, nunca credenciais. Os logs passam por um filtro que mascara segredos.
 - A correção de comentários é a única parte que grava código: só no worktree dela, só o que você aprovou, sem force e nunca em branch protegida.
+- Escrita no provedor só no GitHub e só quando você pede (publicar achados, pedir mudanças). O Bitbucket é só leitura: o token não pode ter escopo de escrita e o app não tem caminho para publicar lá.
 
 ## Custo
 

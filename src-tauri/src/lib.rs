@@ -8,6 +8,7 @@ mod diff;
 mod error;
 mod fix;
 mod github;
+mod hosting;
 mod proc;
 mod publish;
 mod rc;

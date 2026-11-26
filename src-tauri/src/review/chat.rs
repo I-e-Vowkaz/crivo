@@ -51,8 +51,8 @@ pub fn messages(conn: &Connection, run_id: &str) -> AppResult<Vec<ChatMessage>> 
 
 struct RunInfo {
     slug: String,
-    provider: String,
-    owner: String,
+    /// `None` no review de branch local.
+    repo: Option<crate::hosting::RepoRef>,
     bb_id: i64,
     title: String,
     source_branch: String,
@@ -72,7 +72,7 @@ fn load(conn: &Connection, run_id: &str) -> AppResult<RunInfo> {
             "SELECT coalesce(r.slug, rr.repo_slug), ifnull(p.bb_id, 0), coalesce(p.title, rr.branch),
                     coalesce(p.source_branch, rr.branch), coalesce(p.dest_branch, rr.base_branch), rr.source_sha,
                     rr.dest_sha, rr.card_key, rr.run_dir, rr.chat_session_id, rr.status,
-                    ifnull(r.provider, 'local'), ifnull(r.workspace, '')
+                    r.provider, r.workspace
              FROM review_runs rr LEFT JOIN pull_requests p ON p.id = rr.pr_id LEFT JOIN repositories r ON r.id = p.repository_id
              WHERE rr.id = ?1",
             [run_id],
@@ -81,8 +81,10 @@ fn load(conn: &Connection, run_id: &str) -> AppResult<RunInfo> {
                 Ok((
                     RunInfo {
                         slug: r.get(0)?,
-                        provider: r.get(11)?,
-                        owner: r.get(12)?,
+                        repo: match r.get::<_, Option<String>>(11)? {
+                            Some(p) => Some(crate::hosting::RepoRef::from_row(&p, r.get(12)?, r.get(0)?)?),
+                            None => None,
+                        },
                         bb_id: r.get(1)?,
                         title: r.get(2)?,
                         source_branch: r.get(3)?,
@@ -247,7 +249,7 @@ async fn answer(
         let _ = app.emit("chat-update", ChatEvent { run_id, line: Some(line), busy: true });
     };
     // worktree do chat no commit revisado (o do review já foi removido)
-    let repo = if info.provider == "github" { crate::github::clone_path(root, &info.owner, &info.slug) } else { root.join(&info.slug) };
+    let repo = match &info.repo { Some(rr) => rr.clone_dir(root)?, None => root.join(&info.slug) };
     let wt = info.run_dir.join("chat-wt");
     if !wt.join(".git").exists() {
         log("preparando o código do commit revisado");
@@ -344,8 +346,7 @@ mod tests {
     fn primeira_pergunta_leva_o_contexto() {
         let info = RunInfo {
             slug: "acme-back".into(),
-            provider: "bitbucket".into(),
-            owner: "acme".into(),
+            repo: Some(crate::hosting::RepoRef::new("bitbucket", "acme", "acme-back").unwrap()),
             bb_id: 2397,
             title: "PROJ-1503".into(),
             source_branch: "PROJ-1503".into(),

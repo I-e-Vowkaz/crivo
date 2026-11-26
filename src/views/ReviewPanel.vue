@@ -49,6 +49,8 @@ const selectedForPublish = ref<number[]>([]);
 const publishing = ref(false);
 const publishMessage = ref("");
 const publishedHere = ref<number[]>([]);
+/** Publicar só onde o Crivo escreve: no GitHub. O Bitbucket é só leitura. */
+const canPublish = computed(() => props.pr?.provider === "github" && run.value?.status === "completed");
 const selectedText = computed(() => main.value.filter((f) => selectedForPublish.value.includes(f.seq)).map(findingText).join("\n\n---\n\n"));
 
 function togglePublish(seq: number) {
@@ -487,12 +489,12 @@ watch(() => props.runId, load);
             <p v-else-if="run.rc_status === 'failed'" class="msg warn">O agente do pedido de mudanças falhou; use a seleção manual abaixo.</p>
             <p v-else class="muted small">O agente não terminou ({{ run.rc_status }}); use a seleção manual abaixo.</p>
           </div>
-          <div v-if="pr && run.status === 'completed' && main.length" class="card">
+          <div v-if="canPublish && main.length" class="card">
             <strong>Publicar achados na PR</strong>
             <p class="muted small">Selecione os achados abaixo. Confira o texto antes de enviar; o Crivo verifica novamente o commit da PR.</p>
             <pre v-if="selectedForPublish.length" class="suggestion">{{ selectedText }}</pre>
             <button :disabled="publishing || !selectedForPublish.length" @click="publish(false)">Publicar comentário</button>
-            <button v-if="pr.provider === 'github'" class="secondary" :disabled="publishing || !selectedForPublish.length" @click="publish(true)">Pedir mudanças</button>
+            <button class="secondary" :disabled="publishing || !selectedForPublish.length" @click="publish(true)">Pedir mudanças</button>
             <p v-if="publishMessage" class="msg ok">{{ publishMessage }}</p>
           </div>
 
@@ -500,7 +502,7 @@ watch(() => props.runId, load);
             <div class="finding-head">
               <span :class="['sev', effectiveSeverity(f)]">{{ effectiveSeverity(f) }}</span>
               <strong>{{ f.title }}</strong>
-              <label v-if="pr && run.status === 'completed'" class="small"><input type="checkbox" :checked="selectedForPublish.includes(f.seq)" :disabled="publishedHere.includes(f.seq)" @change="togglePublish(f.seq)" /> {{ publishedHere.includes(f.seq) ? "Publicado" : "Publicar" }}</label>
+              <label v-if="canPublish" class="small"><input type="checkbox" :checked="selectedForPublish.includes(f.seq)" :disabled="publishedHere.includes(f.seq)" @change="togglePublish(f.seq)" /> {{ publishedHere.includes(f.seq) ? "Publicado" : "Publicar" }}</label>
               <button class="secondary small-btn push" @click="copy(findingText(f), `F${f.seq}`)">
                 {{ copied === `F${f.seq}` ? "Copiado ✓" : "Copiar" }}
               </button>

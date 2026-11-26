@@ -50,12 +50,18 @@ pub struct Pull {
 
 pub struct Api {
     http: Client,
+    base: String,
     token: String,
     requests: AtomicU32,
 }
 
 impl Api {
     pub fn new(token: String) -> AppResult<Self> {
+        Self::with_base(API, token)
+    }
+
+    /// Como `new`, com outro endereço da API (testes).
+    pub fn with_base(base: &str, token: String) -> AppResult<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("crivo/", env!("CARGO_PKG_VERSION")))
@@ -63,6 +69,7 @@ impl Api {
             .map_err(|e| AppError::Invalid(e.to_string()))?;
         Ok(Self {
             http,
+            base: base.trim_end_matches('/').to_owned(),
             token,
             requests: AtomicU32::new(0),
         })
@@ -83,7 +90,7 @@ impl Api {
         }
         let mut req = self
             .http
-            .request(method, format!("{API}{path}"))
+            .request(method, format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
@@ -106,6 +113,25 @@ impl Api {
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
         self.request(Method::GET, path, None).await
+    }
+
+    /// Números dos PRs abertos do repositório que eu já revisei. Depois do review, o GitHub tira
+    /// o revisor de `requested_reviewers`, e só a busca diz que o PR ainda é meu para acompanhar.
+    pub async fn reviewed_by_me(&self, owner: &str, repo: &str) -> AppResult<std::collections::HashSet<i64>> {
+        let mut out = std::collections::HashSet::new();
+        // a busca devolve no máximo 1000 resultados
+        for page in 1..=10 {
+            let path = format!(
+                "/search/issues?q=is%3Apr+is%3Aopen+repo%3A{owner}%2F{repo}+reviewed-by%3A%40me&per_page=100&page={page}"
+            );
+            let res: Value = self.get(&path).await?;
+            let items = res.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+            out.extend(items.iter().filter_map(|i| i.get("number").and_then(Value::as_i64)));
+            if items.len() < 100 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn pulls(&self, owner: &str, repo: &str) -> AppResult<Vec<Pull>> {
@@ -182,14 +208,6 @@ pub fn configured_repos(raw: Option<Value>) -> AppResult<Vec<(String, String)>> 
     Ok(repos)
 }
 
-pub fn clone_path(root: &Path, owner: &str, repo: &str) -> std::path::PathBuf {
-    let nested = root.join(owner).join(repo);
-    if nested.join(".git").exists() {
-        nested
-    } else {
-        root.join(repo)
-    }
-}
 
 pub fn issue_refs(
     text: &str,
@@ -244,20 +262,24 @@ pub async fn sync_repo(
     repo: &str,
     all: Vec<Pull>,
 ) -> AppResult<usize> {
+    // só os PRs que me dizem respeito têm os reviews lidos (uma chamada por PR). Se a busca
+    // falhar (limite de taxa da busca), lê os reviews de todos e decide por eles, como antes.
+    let reviewed = api.reviewed_by_me(owner, repo).await.ok();
     let mut relevant = Vec::new();
     for pr in all {
         let mine = pr.user.id == me.id;
         let requested = pr.requested_reviewers.iter().any(|u| u.id == me.id);
+        if reviewed.as_ref().is_some_and(|set| !mine && !requested && !set.contains(&pr.number)) {
+            continue;
+        }
         let reviews: Vec<Value> = api
             .get(&format!(
                 "/repos/{owner}/{repo}/pulls/{}/reviews?per_page=100",
                 pr.number
             ))
             .await?;
-        let reviewed_by_me = reviews
-            .iter()
-            .any(|r| r.pointer("/user/id").and_then(Value::as_i64) == Some(me.id));
-        if !mine && !requested && !reviewed_by_me {
+        let by_me = reviews.iter().any(|r| r.pointer("/user/id").and_then(Value::as_i64) == Some(me.id));
+        if reviewed.is_none() && !mine && !requested && !by_me {
             continue;
         }
         let mut reviewers: std::collections::BTreeMap<String, Value> =
@@ -340,7 +362,7 @@ pub async fn open_threads(
     repo: &str,
     number: i64,
     me: &str,
-) -> AppResult<Vec<crate::bitbucket::comments::Thread>> {
+) -> AppResult<Vec<crate::hosting::Thread>> {
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -372,7 +394,7 @@ pub async fn open_threads(
                 let Some(id) = first.get("databaseId").and_then(Value::as_i64) else {
                     continue;
                 };
-                out.push(crate::bitbucket::comments::Thread {
+                out.push(crate::hosting::Thread {
                     id,
                     author: first
                         .pointer("/author/login")
@@ -398,7 +420,7 @@ pub async fn open_threads(
                     replies: comments
                         .iter()
                         .skip(1)
-                        .map(|c| crate::bitbucket::comments::Reply {
+                        .map(|c| crate::hosting::Reply {
                             author: c
                                 .pointer("/author/login")
                                 .and_then(Value::as_str)
@@ -447,7 +469,7 @@ pub async fn open_threads(
             let Some(id) = c.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            out.push(crate::bitbucket::comments::Thread {
+            out.push(crate::hosting::Thread {
                 id: -id,
                 author: c
                     .pointer("/user/login")
@@ -562,5 +584,79 @@ mod tests {
                 ("acme".into(), "docs".into(), 34)
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use crate::bitbucket::client::testserver::{ok, start};
+
+    fn pull(number: i64, author: &str, requested: &[&str]) -> Pull {
+        let req: Vec<Value> = requested.iter().map(|l| serde_json::json!({"login": l, "id": if *l == "eu" { 7 } else { 100 }})).collect();
+        serde_json::from_value(serde_json::json!({
+            "number": number, "title": format!("PROJ-{number}"), "body": null, "html_url": format!("https://gh/{number}"),
+            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-02T00:00:00Z",
+            "user": {"login": author, "id": if author == "eu" { 7 } else { 8 }},
+            "head": {"ref": format!("PROJ-{number}"), "sha": format!("s{number}"), "repo": {"full_name": "acme/app"}},
+            "base": {"ref": "main", "sha": "b"},
+            "requested_reviewers": req
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sem_a_busca_le_os_reviews_de_todos() {
+        use crate::bitbucket::client::testserver::Canned;
+        // a busca falha (limite de taxa): o sync lê os reviews de todos, como antes da busca
+        let srv = start(vec![
+            Canned { status: 403, headers: vec![], body: r#"{"message":"rate limit"}"#.into() },
+            ok("[]"),
+            ok(r#"[{"user":{"login":"eu","id":7},"state":"APPROVED"}]"#),
+            ok("[]"),
+        ]);
+        let api = Api::with_base(&srv.base, "tok".into()).unwrap();
+        let me = User { login: "eu".into(), id: 7 };
+        let db = std::sync::Mutex::new(crate::db::open_in_memory().unwrap());
+        let pulls = vec![pull(1, "eu", &[]), pull(2, "outro", &[]), pull(3, "outro", &[])];
+        assert_eq!(sync_repo(&db, &api, &me, "acme", "app", pulls).await.unwrap(), 2);
+        assert_eq!(api.requests(), 4);
+    }
+
+    #[tokio::test]
+    async fn so_le_os_reviews_dos_prs_relevantes() {
+        // 1 meu, 2 com review pedido a mim, 3 que eu já revisei (só a busca sabe), 4 a 6 sem relação
+        let srv = start(vec![
+            ok(r#"{"items":[{"number":3}]}"#),
+            ok("[]"),
+            ok("[]"),
+            ok(r#"[{"user":{"login":"eu","id":7},"state":"APPROVED"}]"#),
+        ]);
+        let api = Api::with_base(&srv.base, "tok".into()).unwrap();
+        let me = User { login: "eu".into(), id: 7 };
+        let pulls = vec![
+            pull(1, "eu", &[]),
+            pull(2, "outro", &["eu"]),
+            pull(3, "outro", &[]),
+            pull(4, "outro", &[]),
+            pull(5, "outro", &["fulano"]),
+            pull(6, "outro", &[]),
+        ];
+        let db = std::sync::Mutex::new(crate::db::open_in_memory().unwrap());
+        assert_eq!(sync_repo(&db, &api, &me, "acme", "app", pulls).await.unwrap(), 3);
+        assert_eq!(api.requests(), 4);
+        let reqs = srv.requests.lock().unwrap();
+        assert!(reqs[0].contains("/search/issues?q=is%3Apr+is%3Aopen+repo%3Aacme%2Fapp+reviewed-by%3A%40me"), "{}", reqs[0]);
+        let conn = db.lock().unwrap();
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT bb_id, category FROM pull_requests ORDER BY bb_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, "authored".into()), (2, "review_requested".into()), (3, "review_requested".into())]);
+        let reviewers: String = conn.query_row("SELECT reviewers_json FROM pull_requests WHERE bb_id = 3", [], |r| r.get(0)).unwrap();
+        assert!(reviewers.contains(r#""approved":true"#), "{reviewers}");
     }
 }
