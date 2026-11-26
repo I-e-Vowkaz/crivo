@@ -20,6 +20,7 @@ const agent: Record<string, string> = {
   "quality-haiku": "Haiku · melhorias",
   "judge-sonnet": "Sonnet · juiz",
   "audit-opus": "Opus · auditoria",
+  "rc-sonnet": "Sonnet · pedido de mudanças",
   "browser-haiku": "Haiku · navegador",
 };
 const callText = (c: RunCall) =>

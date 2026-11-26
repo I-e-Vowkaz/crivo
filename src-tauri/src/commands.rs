@@ -535,6 +535,12 @@ pub struct FindingView {
     score: Option<i64>,
     score_why: Option<String>,
     importance: Option<String>,
+    /// Pedido de mudanças (`rc-validator`): bloqueante, sugestao ou fora; o principal, quando
+    /// este repete outro; o comentário pronto e o porquê (só para o revisor).
+    rc_decision: Option<String>,
+    rc_duplicate_of: Option<i64>,
+    rc_body: Option<String>,
+    rc_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -560,6 +566,11 @@ pub struct RunView {
     /// PR que precisa de checkout para o teste no navegador rodar, e o rótulo `repo#id`.
     browser_checkout_pr_id: Option<i64>,
     browser_checkout_label: Option<String>,
+    /// Pedido de mudanças: running, completed, failed, cancelled, not_needed ou nulo (não se aplica).
+    rc_status: Option<String>,
+    rc_summary: Option<String>,
+    /// Link do review enviado ao GitHub.
+    rc_sent_url: Option<String>,
     run_dir: String,
     findings: Vec<FindingView>,
     browser_tests: Vec<BrowserTestView>,
@@ -594,7 +605,8 @@ pub fn run_view(conn: &Connection, run_id: &str) -> AppResult<RunView> {
     let mut run = conn.query_row(
         "SELECT rr.id, rr.pr_id, rr.status, rr.stage, rr.audit_status, rr.card_key, rr.started_at, rr.finished_at,
                 rr.cost_usd, rr.error, rr.run_dir, rr.warning, rr.browser_status, rr.browser_note,
-                rr.browser_checkout_pr_id, cr.slug || '#' || cp.bb_id, rr.quality_status, rr.repo_slug, rr.branch
+                rr.browser_checkout_pr_id, cr.slug || '#' || cp.bb_id, rr.quality_status, rr.repo_slug, rr.branch,
+                rr.rc_status, rr.rc_summary, rr.rc_sent_url
          FROM review_runs rr
          LEFT JOIN pull_requests cp ON cp.id = rr.browser_checkout_pr_id
          LEFT JOIN repositories cr ON cr.id = cp.repository_id
@@ -621,6 +633,9 @@ pub fn run_view(conn: &Connection, run_id: &str) -> AppResult<RunView> {
                 quality_status: r.get(16)?,
                 repo_slug: r.get(17)?,
                 branch: r.get(18)?,
+                rc_status: r.get(19)?,
+                rc_summary: r.get(20)?,
+                rc_sent_url: r.get(21)?,
                 findings: vec![],
                 browser_tests: vec![],
                 log: vec![],
@@ -633,7 +648,8 @@ pub fn run_view(conn: &Connection, run_id: &str) -> AppResult<RunView> {
         "SELECT seq, project, kind, severity, severity_reason, impact, file, line, title, description, steps_json,
                 pattern_ref, confidence, markdown, validation, reject_reason, in_diff, audit_decision,
                 audit_new_severity, audit_rationale, category, evidence, suggestion,
-                end_line, existing_code, improved_code, score, score_why, importance
+                end_line, existing_code, improved_code, score, score_why, importance,
+                rc_decision, rc_duplicate_of, rc_body, rc_reason
          FROM findings WHERE run_id = ?1 ORDER BY seq",
     )?;
     run.findings = stmt
@@ -669,6 +685,10 @@ pub fn run_view(conn: &Connection, run_id: &str) -> AppResult<RunView> {
                 score: r.get(26)?,
                 score_why: r.get(27)?,
                 importance: r.get(28)?,
+                rc_decision: r.get(29)?,
+                rc_duplicate_of: r.get(30)?,
+                rc_body: r.get(31)?,
+                rc_reason: r.get(32)?,
             })
         })?
         .collect::<Result<_, _>>()?;

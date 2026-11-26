@@ -787,6 +787,14 @@ h3.sub {
   font-weight: 600;
   color: var(--text);
 }
+/* item do pedido de mudanças: checkbox + rótulo, comentário e o porquê */
+.rc-item {
+  border-top: 1px solid var(--border);
+  padding: 8px 0 4px;
+}
+.rc-item p {
+  margin: 4px 0;
+}
 /* severidade: laranja só em CRITICAL e HIGH; MEDIUM em branco; o resto em cinza */
 .sev,
 .tstat,

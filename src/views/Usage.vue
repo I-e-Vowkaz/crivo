@@ -26,6 +26,7 @@ const secs = (msv: number | null) => (msv === null ? "—" : msv < 60_000 ? `${M
 const agentLabel: Record<string, string> = {
   "review-sonnet": "Sonnet · review",
   "audit-opus": "Opus · auditoria",
+  "rc-sonnet": "Sonnet · pedido de mudanças",
   "judge-sonnet": "Sonnet · juiz",
   "quality-haiku": "Haiku · melhorias",
   "browser-haiku": "Haiku · navegador",

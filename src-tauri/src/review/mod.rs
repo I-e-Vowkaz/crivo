@@ -552,6 +552,7 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
             Ok(c.execute(
                 "UPDATE review_runs SET status = ?1, stage = ?2, error = ?3,
                    audit_status = CASE WHEN audit_status = 'running' THEN ?1 ELSE audit_status END,
+                   rc_status = CASE WHEN rc_status = 'running' THEN ?1 ELSE rc_status END,
                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?4",
                 params![status, stage, error, ctx.run_id],
             )?)
@@ -966,6 +967,12 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
         save_cost(ctx, cost)?;
     }
 
+    // ---- pedido de mudanças (Sonnet `rc-validator`), só em PR do GitHub ----
+    if pr.provider == "github" && !pr.local {
+        cost += request_changes(ctx, wt, &src, &base, &card_path, &conventions).await?;
+        save_cost(ctx, cost)?;
+    }
+
     // ---- navegador (Haiku), só com o ambiente local no commit do PR ----
     ctx.check_cancel()?;
     if pr.local {
@@ -1321,6 +1328,158 @@ async fn audit(ctx: &Ctx, wt: &Path, src: &str, base: &str, card_path: &Path, to
             // o review do Sonnet continua valendo; só a auditoria falhou
             ctx.with_db(|c| Ok(c.execute("UPDATE review_runs SET audit_status = 'failed' WHERE id = ?1", [&ctx.run_id])?))?;
             ctx.log(&format!("auditoria do Opus falhou ({status:?}); os achados do Sonnet ficam sem auditoria"));
+        }
+    }
+    Ok(cost)
+}
+
+/// Nota mínima do juiz para uma melhoria entrar como candidata ao RC (importância alta).
+const RC_MIN_SCORE: i64 = 7;
+
+/// Candidatos ao pedido de mudanças: bugs válidos que o Opus não derrubou e melhorias de nota
+/// alta, no formato do `FINDINGS_FILE` do `rc-validator`.
+fn rc_candidates(conn: &Connection, run_id: &str) -> AppResult<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, kind, coalesce(audit_new_severity, severity), audit_decision, audit_rationale, score, category,
+                file, line, in_diff, title, description, steps_json, markdown
+         FROM findings
+         WHERE run_id = ?1 AND validation = 'ok'
+           AND ((ifnull(kind, '') != 'melhoria' AND ifnull(audit_decision, '') != 'falso_positivo')
+                OR (kind = 'melhoria' AND ifnull(score, 0) >= ?2))
+         ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![run_id, RC_MIN_SCORE], |r| {
+        let steps: String = r.get(12)?;
+        Ok(json!({
+            "id": format!("F{}", r.get::<_, i64>(0)?),
+            "kind": r.get::<_, Option<String>>(1)?,
+            "severity": r.get::<_, Option<String>>(2)?,
+            "audit_decision": r.get::<_, Option<String>>(3)?,
+            "audit_rationale": r.get::<_, Option<String>>(4)?,
+            "score": r.get::<_, Option<i64>>(5)?,
+            "category": r.get::<_, Option<String>>(6)?,
+            "file": r.get::<_, Option<String>>(7)?,
+            "line": r.get::<_, Option<i64>>(8)?,
+            "in_diff": r.get::<_, Option<bool>>(9)?,
+            "title": r.get::<_, Option<String>>(10)?,
+            "description": r.get::<_, Option<String>>(11)?,
+            "steps": serde_json::from_str::<Value>(&steps).unwrap_or_else(|_| json!([])),
+            "markdown": r.get::<_, Option<String>>(13)?,
+        }))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Decisão do `rc-validator` para um candidato, já conferida pelo app.
+#[derive(Debug, PartialEq)]
+struct RcDecision {
+    seq: i64,
+    decision: &'static str,
+    duplicate_of: Option<i64>,
+    body: String,
+    reason: String,
+}
+
+/// Aplica as regras do app sobre a saída do agente: candidato sem decisão fica fora, duplicado
+/// (de outro candidato) fica fora, e o que entra no RC precisa ter o texto do comentário.
+fn rc_decisions(candidates: &[i64], items: &[Value]) -> Vec<RcDecision> {
+    let seq_of = |v: &Value| v.as_str().and_then(|s| s.trim().trim_start_matches('F').parse::<i64>().ok());
+    candidates
+        .iter()
+        .map(|&seq| {
+            let Some(item) = items.iter().find(|i| seq_of(&i["id"]) == Some(seq)) else {
+                return RcDecision { seq, decision: "fora", duplicate_of: None, body: String::new(), reason: "o agente não avaliou este achado".into() };
+            };
+            let reason = item["reason"].as_str().unwrap_or("").trim().to_owned();
+            let body = item["body"].as_str().unwrap_or("").trim().to_owned();
+            let duplicate_of = seq_of(&item["duplicate_of"]).filter(|d| *d != seq && candidates.contains(d));
+            let decision = match item["decision"].as_str() {
+                _ if duplicate_of.is_some() => "fora",
+                Some("bloqueante") if !body.is_empty() => "bloqueante",
+                Some("sugestao") if !body.is_empty() => "sugestao",
+                _ => "fora",
+            };
+            let body = if decision == "fora" { String::new() } else { body };
+            RcDecision { seq, decision, duplicate_of, body, reason }
+        })
+        .collect()
+}
+
+/// Sonnet (`rc-validator`): valida os candidatos e monta o pedido de mudanças, que o revisor envia
+/// com um clique. Se falhar, o review continua valendo e a publicação manual segue disponível.
+/// Devolve o custo.
+async fn request_changes(ctx: &Ctx, wt: &Path, src: &str, base: &str, card_path: &Path, conventions: &str) -> AppResult<f64> {
+    ctx.check_cancel()?;
+    let candidates = ctx.with_db(|c| rc_candidates(c, &ctx.run_id))?;
+    if candidates.is_empty() {
+        ctx.with_db(|c| Ok(c.execute("UPDATE review_runs SET rc_status = 'not_needed' WHERE id = ?1", [&ctx.run_id])?))?;
+        ctx.log("pedido de mudanças: nenhum achado candidato");
+        return Ok(0.0);
+    }
+    let label = format!("Sonnet validando o pedido de mudanças ({} achado(s))", candidates.len());
+    ctx.stage(&label);
+    ctx.with_db(|c| Ok(c.execute("UPDATE review_runs SET rc_status = 'running' WHERE id = ?1", [&ctx.run_id])?))?;
+    let input = ctx.run_dir.join("rc-input.json");
+    std::fs::write(&input, serde_json::to_vec_pretty(&candidates)?)?;
+    let mut opts: Vec<String> = vec![
+        "--agent".into(), "rc-validator".into(), "--agents".into(), agents_json(&["rc-validator"])?,
+        "--model".into(), "sonnet".into(), "--effort".into(), "medium".into(),
+        "--json-schema".into(), std::fs::read_to_string(assets().join("schemas/request-changes.json"))?,
+        "--add-dir".into(), ctx.run_dir.display().to_string(),
+        "--allowedTools".into(), READ_ONLY_TOOLS.replace("Agent ", ""),
+        "--disallowedTools".into(), "Edit Write NotebookEdit Agent mcp__atlassian__* mcp__claude-in-chrome__*".into(),
+        "--max-turns".into(), "40".into(), "--max-budget-usd".into(), "2".into(),
+    ];
+    opts.extend(worker_config(false, false));
+    opts.extend(writing_style_opts());
+    let spec = Spec {
+        session: claude::Session::Ephemeral,
+        name: "rc-sonnet".into(),
+        opts,
+        prompt: format!(
+            "WORKTREE: {}\nSOURCE_SHA: {src}\nBASE: {base}\nCARD_FILE: {}\nCONVENTIONS_FILE: {conventions}\nFINDINGS_FILE: {}\n\
+             Valide cada candidato do FINDINGS_FILE e monte o pedido de mudanças.",
+            wt.display(),
+            card_path.display(),
+            input.display()
+        ),
+        cwd: wt.to_path_buf(),
+        log_dir: ctx.run_dir.clone(),
+        env_extra: vec![cache_5m()],
+        timeout: QUALITY_TIMEOUT,
+    };
+    let out = ctx.run_claude(spec, &label, |l| ctx.log(&l)).await?;
+    let cost = out.result.as_ref().and_then(|r| r.get("total_cost_usd")).and_then(Value::as_f64).unwrap_or(0.0);
+    let so = out.result.as_ref().and_then(|r| r.get("structured_output"));
+    let items = so.and_then(|s| s.get("items")).and_then(Value::as_array).cloned();
+    match (out.status, items) {
+        (Status::Completed, Some(items)) => {
+            let seqs: Vec<i64> = candidates.iter().filter_map(|c| c["id"].as_str()?.trim_start_matches('F').parse().ok()).collect();
+            let decisions = rc_decisions(&seqs, &items);
+            let summary = so.and_then(|s| s["summary"].as_str()).unwrap_or("").trim().to_owned();
+            ctx.with_db(|c| {
+                for d in &decisions {
+                    c.execute(
+                        "UPDATE findings SET rc_decision = ?1, rc_duplicate_of = ?2, rc_body = ?3, rc_reason = ?4
+                         WHERE run_id = ?5 AND seq = ?6",
+                        params![d.decision, d.duplicate_of, (!d.body.is_empty()).then_some(&d.body), d.reason, ctx.run_id, d.seq],
+                    )?;
+                }
+                c.execute("UPDATE review_runs SET rc_status = 'completed', rc_summary = ?1 WHERE id = ?2", params![summary, ctx.run_id])?;
+                Ok(())
+            })?;
+            let count = |k: &str| decisions.iter().filter(|d| d.decision == k).count();
+            ctx.log(&format!(
+                "pedido de mudanças: {} bloqueante(s), {} sugestão(ões), {} fora",
+                count("bloqueante"),
+                count("sugestao"),
+                count("fora")
+            ));
+        }
+        (Status::Cancelled, _) => return Err(AppError::Invalid("cancelado".into())),
+        (status, _) => {
+            ctx.with_db(|c| Ok(c.execute("UPDATE review_runs SET rc_status = 'failed' WHERE id = ?1", [&ctx.run_id])?))?;
+            ctx.log(&format!("o pedido de mudanças falhou ({status:?}); publique pela seleção manual"));
         }
     }
     Ok(cost)
@@ -1751,6 +1910,67 @@ mod tests {
         let a = &v["complexity-judge"];
         assert_eq!((a["model"].as_str(), a["effort"].as_str()), (Some("sonnet"), Some("low")));
         assert!(a["tools"].as_array().unwrap().iter().any(|t| t == "StructuredOutput"), "achado 3 da Fase 0");
+    }
+
+    #[test]
+    fn agents_json_do_rc_validator() {
+        let v: Value = serde_json::from_str(&agents_json(&["rc-validator"]).unwrap()).unwrap();
+        let a = &v["rc-validator"];
+        assert_eq!((a["model"].as_str(), a["effort"].as_str()), (Some("sonnet"), Some("medium")));
+        assert!(a["tools"].as_array().unwrap().iter().any(|t| t == "StructuredOutput"));
+        assert!(a["disallowedTools"].as_array().unwrap().iter().any(|t| t == "Edit"));
+        assert!(a["prompt"].as_str().unwrap().contains("pedido de mudanças"));
+    }
+
+    #[test]
+    fn rc_candidatos_sem_falso_positivo_e_so_melhoria_de_nota_alta() {
+        let conn = crate::db::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO repositories (id, provider, workspace, slug) VALUES (1, 'github', 'acme', 'app');
+             INSERT INTO pull_requests (id, repository_id, bb_id, title, url, author_uuid, reviewers_json, participants_json,
+               source_branch, dest_branch, source_sha, dest_sha, state, created_on, updated_on, category)
+             VALUES (1, 1, 7, 't', 'u', 'a', '[]', '[]', 'PROJ-1', 'main', 'abc', 'd', 'OPEN', 'x', 'x', 'review_requested');
+             INSERT INTO review_runs (id, pr_id, source_sha, status, run_dir) VALUES ('r1', 1, 'abc', 'running', '/r');
+             INSERT INTO findings (run_id, seq, kind, severity, audit_decision, audit_new_severity, validation, score) VALUES
+               ('r1', 1, 'bug', 'medium', 'severidade_ajustada', 'high', 'ok', NULL),
+               ('r1', 2, 'bug', 'high', 'falso_positivo', NULL, 'ok', NULL),
+               ('r1', 3, 'bug', 'high', NULL, NULL, 'rejected', NULL),
+               ('r1', 4, 'melhoria', NULL, NULL, NULL, 'ok', 8),
+               ('r1', 5, 'melhoria', NULL, NULL, NULL, 'ok', 6),
+               ('r1', 6, 'requisito', 'high', NULL, NULL, 'ok', NULL);",
+        )
+        .unwrap();
+        let c = rc_candidates(&conn, "r1").unwrap();
+        let ids: Vec<&str> = c.iter().map(|f| f["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["F1", "F4", "F6"]);
+        assert_eq!(c[0]["severity"], "high", "severidade já com o ajuste do Opus");
+        assert_eq!(c[0]["steps"], json!([]));
+    }
+
+    #[test]
+    fn rc_decisoes_conferidas_pelo_app() {
+        let items = vec![
+            json!({"id": "F1", "decision": "bloqueante", "reason": "r1", "body": "  corrija  "}),
+            json!({"id": "F2", "decision": "bloqueante", "duplicate_of": "F1", "reason": "igual ao F1", "body": "x"}),
+            json!({"id": "F3", "decision": "sugestao", "reason": "sem texto", "body": " "}),
+            json!({"id": "F4", "decision": "fora", "reason": "na base", "body": "não vai"}),
+            json!({"id": "F5", "decision": "sugestao", "duplicate_of": "F5", "reason": "r5", "body": "ok"}),
+            json!({"id": "F9", "decision": "bloqueante", "reason": "não é candidato", "body": "x"}),
+        ];
+        let d = rc_decisions(&[1, 2, 3, 4, 5, 6], &items);
+        let got: Vec<(i64, &str, Option<i64>, &str)> = d.iter().map(|d| (d.seq, d.decision, d.duplicate_of, d.body.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "bloqueante", None, "corrija"),
+                (2, "fora", Some(1), ""),
+                (3, "fora", None, ""),
+                (4, "fora", None, ""),
+                (5, "sugestao", None, "ok"),
+                (6, "fora", None, ""),
+            ]
+        );
+        assert_eq!(d[5].reason, "o agente não avaliou este achado");
     }
 
     #[test]

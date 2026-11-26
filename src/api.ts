@@ -192,6 +192,13 @@ export interface Finding {
   score: number | null;
   score_why: string | null;
   importance: "alta" | "media" | "baixa" | null;
+  /** Pedido de mudanças (rc-validator): o que entra no RC e o comentário pronto. */
+  rc_decision: "bloqueante" | "sugestao" | "fora" | null;
+  /** Achado principal, quando este repete outro. */
+  rc_duplicate_of: number | null;
+  rc_body: string | null;
+  /** Por que o agente decidiu assim (não vai para a PR). */
+  rc_reason: string | null;
 }
 
 export interface Run {
@@ -215,6 +222,11 @@ export interface Run {
   browser_note: string | null;
   browser_checkout_pr_id: number | null;
   browser_checkout_label: string | null;
+  /** Pedido de mudanças montado pelo rc-validator (só PR do GitHub); nulo quando não se aplica. */
+  rc_status: "running" | "completed" | "failed" | "cancelled" | "not_needed" | null;
+  rc_summary: string | null;
+  /** Link do review enviado. */
+  rc_sent_url: string | null;
   run_dir: string;
   findings: Finding[];
   browser_tests: BrowserTest[];
@@ -395,6 +407,8 @@ export const api = {
   reviewCancel: (runId: string) => invoke<void>("review_cancel", { runId }),
   reviewGet: (runId: string) => invoke<Run>("review_get", { runId }),
   publishFindings: (runId: string, seqs: number[], requestChanges: boolean) => invoke<{seq: number; url: string | null}[]>("publish_findings", { runId, seqs, requestChanges }),
+  sendRequestChanges: (runId: string, skip: number[]) =>
+    invoke<{ url: string | null; event: "REQUEST_CHANGES" | "COMMENT"; comments: number }>("send_request_changes", { runId, skip }),
   testAppsGet: () => invoke<TestAppView[]>("test_apps_get"),
   testAppSave: (apps: TestApp[], passwordFor?: string, password?: string) =>
     invoke<TestAppView[]>("test_app_save", { apps, passwordFor, password }),
