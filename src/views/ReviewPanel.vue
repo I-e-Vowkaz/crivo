@@ -44,6 +44,34 @@ const view = ref<"review" | "chat" | "diff">("review");
 const diffOpened = ref(false);
 const flashSeq = ref<number | null>(null);
 const showRejected = ref(false);
+const selectedForPublish = ref<number[]>([]);
+const publishing = ref(false);
+const publishMessage = ref("");
+const publishedHere = ref<number[]>([]);
+const selectedText = computed(() => main.value.filter((f) => selectedForPublish.value.includes(f.seq)).map(findingText).join("\n\n---\n\n"));
+
+function togglePublish(seq: number) {
+  selectedForPublish.value = selectedForPublish.value.includes(seq)
+    ? selectedForPublish.value.filter((s) => s !== seq)
+    : [...selectedForPublish.value, seq];
+}
+
+async function publish(requestChanges: boolean) {
+  if (!selectedForPublish.value.length) return;
+  if (!window.confirm(`Publicar ${selectedForPublish.value.length} achado(s) na PR?`)) return;
+  publishing.value = true;
+  publishMessage.value = "";
+  try {
+    const sent = await api.publishFindings(props.runId, selectedForPublish.value, requestChanges);
+    publishedHere.value.push(...sent.map((s) => s.seq));
+    selectedForPublish.value = [];
+    publishMessage.value = `${sent.length} achado(s) publicado(s).`;
+  } catch (e) {
+    error.value = errorText(e);
+  } finally {
+    publishing.value = false;
+  }
+}
 const unlisten: (() => void)[] = [];
 
 async function load() {
@@ -382,11 +410,20 @@ watch(() => props.runId, load);
             <span v-else-if="run.audit_status === 'failed'" class="muted small">— auditoria do Opus falhou</span>
           </h3>
           <p v-if="run.status === 'completed' && !main.length && !run.warning" class="msg ok">Nenhum bug encontrado.</p>
+          <div v-if="pr && run.status === 'completed' && main.length" class="card">
+            <strong>Publicar achados na PR</strong>
+            <p class="muted small">Selecione os achados abaixo. Confira o texto antes de enviar; o Crivo verifica novamente o commit da PR.</p>
+            <pre v-if="selectedForPublish.length" class="suggestion">{{ selectedText }}</pre>
+            <button :disabled="publishing || !selectedForPublish.length" @click="publish(false)">Publicar comentário</button>
+            <button v-if="pr.provider === 'github'" class="secondary" :disabled="publishing || !selectedForPublish.length" @click="publish(true)">Pedir mudanças</button>
+            <p v-if="publishMessage" class="msg ok">{{ publishMessage }}</p>
+          </div>
 
           <article v-for="f in main" :id="`finding-${f.seq}`" :key="f.seq" :class="['finding', { flash: flashSeq === f.seq }]">
             <div class="finding-head">
               <span :class="['sev', effectiveSeverity(f)]">{{ effectiveSeverity(f) }}</span>
               <strong>{{ f.title }}</strong>
+              <label v-if="pr && run.status === 'completed'" class="small"><input type="checkbox" :checked="selectedForPublish.includes(f.seq)" :disabled="publishedHere.includes(f.seq)" @change="togglePublish(f.seq)" /> {{ publishedHere.includes(f.seq) ? "Publicado" : "Publicar" }}</label>
               <button class="secondary small-btn push" @click="copy(findingText(f), `F${f.seq}`)">
                 {{ copied === `F${f.seq}` ? "Copiado ✓" : "Copiar" }}
               </button>

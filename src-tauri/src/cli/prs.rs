@@ -13,7 +13,7 @@ O painel do dia: os PRs para você revisar (com o último review) e os seus (ped
 aprovações, comentários e correção), como nas listas do app. Não chama o Claude.
 
 opções:
-  --sync                     atualiza os PRs do Bitbucket antes
+  --sync                     atualiza os PRs configurados antes
   --all                      mostra também os PRs que você já aprovou
   --output-format text|json  formato no stdout (padrão: text)
   -h, --help                 mostra esta ajuda

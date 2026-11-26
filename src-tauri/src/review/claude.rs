@@ -148,7 +148,7 @@ pub fn clean_env(extra: &[(String, String)]) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
             let up = k.to_ascii_uppercase();
-            !SECRET_ENV.iter().any(|s| up.contains(s))
+            k == "CLAUDE_CODE_OAUTH_TOKEN" || !SECRET_ENV.iter().any(|s| up.contains(s))
         })
         .collect();
     env.extend(extra.iter().cloned());
@@ -547,9 +547,12 @@ mod tests {
         unsafe {
             std::env::set_var("BITBUCKET_TOKEN_TESTE", "x");
             std::env::set_var("MY_SECRET_TESTE", "x");
+            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "token-de-teste");
         }
         let env = clean_env(&[("EXTRA".into(), "1".into())]);
         assert!(!env.iter().any(|(k, _)| k == "BITBUCKET_TOKEN_TESTE" || k == "MY_SECRET_TESTE"));
+        assert!(env.iter().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v == "token-de-teste"));
         assert!(env.iter().any(|(k, v)| k == "EXTRA" && v == "1"));
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"); }
     }
 }

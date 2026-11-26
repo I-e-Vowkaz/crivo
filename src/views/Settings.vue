@@ -6,6 +6,11 @@ const info = ref<AppInfo | null>(null);
 const email = ref("");
 const workspace = ref("");
 const repos = ref("");
+const githubRepos = ref("");
+const githubToken = ref("");
+const githubTokenSaved = ref(false);
+const githubAccount = ref("");
+const githubMode = ref("gh");
 const reposRoot = ref("");
 const jiraSiteInput = ref("");
 const tokenSaved = ref(false);
@@ -24,6 +29,9 @@ async function load() {
     workspace.value = (await api.settingGet<string>("bitbucket.workspace")) ?? "";
     const r = await api.settingGet<string[] | string>("bitbucket.repos");
     repos.value = Array.isArray(r) ? r.join(", ") : (r ?? "");
+    githubRepos.value = ((await api.settingGet<string[]>("github.repos")) ?? []).join(", ");
+    githubMode.value = (await api.settingGet<string>("github.auth_mode")) ?? "gh";
+    githubTokenSaved.value = (await api.secretStatus("github")).saved;
     reposRoot.value = (await api.settingGet<string>("repos.root")) ?? "";
     jiraSiteInput.value = (await api.settingGet<string>("jira.site")) ?? "";
     tokenSaved.value = (await api.secretStatus("bitbucket")).saved;
@@ -106,12 +114,39 @@ const saveAccount = () =>
       "bitbucket.repos",
       repos.value.split(",").map((s) => s.trim()).filter(Boolean),
     );
+  }, "Bitbucket salvo.");
+
+const saveProjectSettings = () => run(async () => {
     await api.settingSet("repos.root", reposRoot.value.trim());
     const site = normalizeJiraSite(jiraSiteInput.value);
     await api.settingSet("jira.site", site);
     jiraSiteInput.value = site;
     jiraSite.value = site;
-  }, "Configurações salvas.");
+  }, "Pasta dos projetos e Jira salvos.");
+
+const saveGithubRepos = () => run(async () => {
+  await api.settingSet("github.repos", splitList(githubRepos.value));
+}, "Repositórios GitHub salvos.");
+
+const saveGithubToken = () => run(async () => {
+  const account = await api.githubSaveToken(githubToken.value);
+  githubAccount.value = account.login;
+  githubMode.value = account.mode;
+  githubTokenSaved.value = true;
+  githubToken.value = "";
+}, "Token GitHub validado e salvo.");
+
+const useGh = () => run(async () => {
+  const account = await api.githubUseGh();
+  githubAccount.value = account.login;
+  githubMode.value = account.mode;
+}, "Credencial local do gh validada.");
+const loginGh = () => run(() => api.githubLogin(), "Conclua o login OAuth 2 no terminal e depois valide a credencial aqui.");
+const deleteGithubToken = () => run(async () => {
+  await api.secretDelete("github");
+  githubTokenSaved.value = false;
+  githubMode.value = "gh";
+}, "Token GitHub removido.");
 
 const saveToken = () =>
   run(async () => {
@@ -130,6 +165,41 @@ onMounted(load);
 </script>
 
 <template>
+  <p v-if="message" :class="['msg', message.kind]">{{ message.text }}</p>
+  <section class="card">
+    <h2>GitHub.com</h2>
+    <form class="grid" @submit.prevent="saveGithubRepos">
+      <label class="wide">Repositórios monitorados (owner/repo, separados por vírgula)
+        <input v-model="githubRepos" placeholder="minha-org/meu-repo" />
+      </label>
+      <div><button type="submit" :disabled="busy">Salvar repositórios</button></div>
+    </form>
+    <p class="muted small">Autenticação atual: {{ githubMode === "token" ? "token" : "GitHub CLI" }} {{ githubAccount ? `(${githubAccount})` : "" }}</p>
+    <div class="token">
+      <form @submit.prevent="saveGithubToken">
+        <input v-model="githubToken" type="password" autocomplete="off" placeholder="Token GitHub" />
+        <button type="submit" :disabled="busy || !githubToken.trim()">Usar token</button>
+        <button v-if="githubTokenSaved" type="button" class="secondary" :disabled="busy" @click="deleteGithubToken">Remover token</button>
+      </form>
+      <button type="button" class="secondary" :disabled="busy" @click="useGh">Usar login do gh nesta máquina</button>
+      <button type="button" class="secondary" :disabled="busy" @click="loginGh">Entrar com OAuth 2 pelo gh</button>
+      <p class="muted small">Depois de concluir o login no terminal, clique em “Usar login do gh nesta máquina”.</p>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Projetos locais e Jira</h2>
+    <form class="grid" @submit.prevent="saveProjectSettings">
+      <label class="wide">
+        Pasta dos clones locais (cada repo em &lt;pasta&gt;/&lt;repo&gt;; GitHub também aceita &lt;pasta&gt;/&lt;owner&gt;/&lt;repo&gt;)
+        <input v-model="reposRoot" type="text" autocomplete="off" placeholder="~/Projects (padrão)" />
+      </label>
+      <label class="wide">
+        Site do Jira (opcional; deixe vazio para usar apenas a descrição da PR e GitHub Issues)
+        <input v-model="jiraSiteInput" type="text" autocomplete="off" placeholder="empresa.atlassian.net" />
+      </label>
+      <div><button type="submit" :disabled="busy">Salvar</button></div>
+    </form>
+  </section>
   <section class="card">
     <h2>Bitbucket</h2>
     <form class="grid" @submit.prevent="saveAccount">
@@ -144,14 +214,6 @@ onMounted(load);
       <label class="wide">
         Repositórios monitorados (separados por vírgula)
         <input v-model="repos" type="text" autocomplete="off" placeholder="meu-back, meu-front" />
-      </label>
-      <label class="wide">
-        Pasta dos clones locais (cada repo em &lt;pasta&gt;/&lt;repo&gt;)
-        <input v-model="reposRoot" type="text" autocomplete="off" placeholder="~/Projects (padrão)" />
-      </label>
-      <label class="wide">
-        Site do Jira (link do card e leitura do card pelo MCP do Atlassian)
-        <input v-model="jiraSiteInput" type="text" autocomplete="off" placeholder="empresa.atlassian.net" />
       </label>
       <div><button type="submit" :disabled="busy">Salvar</button></div>
     </form>
@@ -173,12 +235,11 @@ onMounted(load);
         <button v-if="tokenSaved" type="button" class="secondary" :disabled="busy" @click="deleteToken">Remover</button>
       </form>
       <p class="muted small">
-        Somente leitura: <code>read:pullrequest</code>, <code>read:repository</code>, <code>read:user</code>. Fica no
+        Leitura: <code>read:pullrequest</code>, <code>read:repository</code>, <code>read:user</code>. Para publicar, adicione <code>write:pullrequest</code>. Fica no
         cofre do sistema e nunca volta para esta tela.
       </p>
     </div>
 
-    <p v-if="message" :class="['msg', message.kind]">{{ message.text }}</p>
   </section>
 
   <section class="card">

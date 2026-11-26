@@ -44,7 +44,7 @@ pub(crate) fn assets() -> PathBuf {
 }
 
 pub(crate) const READ_ONLY_TOOLS: &str = "Read Grep Glob Agent Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git blame *) \
-Bash(git merge-tree *) Bash(git rev-list *) Bash(git rev-parse *) Bash(git ls-files *) Bash(git -C *) Bash(grep *) \
+Bash(git merge-tree *) Bash(git rev-list *) Bash(git rev-parse *) Bash(git ls-files *) Bash(grep *) \
 Bash(rg *) Bash(ls *) Bash(cat *) Bash(head *) Bash(tail *) Bash(wc *) Bash(find *) Bash(sed -n *)";
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -174,6 +174,8 @@ pub type Registry = Mutex<HashMap<String, Arc<RunCtl>>>;
 
 #[derive(Debug, Clone)]
 pub struct PrForReview {
+    pub provider: String,
+    pub owner: String,
     pub slug: String,
     pub bb_id: i64,
     pub title: String,
@@ -192,11 +194,13 @@ pub struct PrForReview {
 fn load_pr(conn: &Connection, pr_id: i64) -> AppResult<PrForReview> {
     conn.query_row(
         "SELECT r.slug, p.bb_id, p.title, ifnull(p.description, ''), ifnull(p.author_name, ''),
-                p.url, p.source_branch, p.dest_branch, p.source_sha, p.dest_sha
+                p.url, p.source_branch, p.dest_branch, p.source_sha, p.dest_sha, r.provider, r.workspace
          FROM pull_requests p JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
         [pr_id],
         |r| {
             Ok(PrForReview {
+                provider: r.get(10)?,
+                owner: r.get(11)?,
                 slug: r.get(0)?,
                 bb_id: r.get(1)?,
                 title: r.get(2)?,
@@ -268,6 +272,11 @@ pub fn card_key(branch: &str, title: &str) -> Option<String> {
             (digits > 0).then(|| text[i..i + letters + 1 + digits].to_owned())
         })
     })
+}
+
+/// O Jira só participa quando foi configurado explicitamente.
+pub fn configured_jira_key(conn: &Connection, branch: &str, title: &str) -> AppResult<Option<String>> {
+    Ok(jira_site(conn)?.and_then(|_| card_key(branch, title)))
 }
 
 fn new_run_id() -> String {
@@ -444,6 +453,8 @@ pub async fn start_branch_run(host: Host, slug: String, branch: String) -> AppRe
         return Err(AppError::Invalid(format!("{branch} é a própria base do review")));
     }
     let pr = PrForReview {
+        provider: "local".into(),
+        owner: String::new(),
         slug,
         bb_id: 0,
         title: branch.clone(),
@@ -468,7 +479,7 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
     if git::is_protected(&pr.source_branch) {
         return Err(AppError::Invalid(format!("recusado: a branch de origem {} é protegida", pr.source_branch)));
     }
-    let repo = root.join(&pr.slug);
+    let repo = if pr.provider == "github" { crate::github::clone_path(root, &pr.owner, &pr.slug) } else { root.join(&pr.slug) };
     if !repo.join(".git").exists() {
         return Err(AppError::Invalid(format!(
             "não achei o clone local de {} em {} (ajuste a pasta dos repositórios nas Configurações)",
@@ -480,7 +491,10 @@ fn launch(host: Host, pr_id: Option<i64>, pr: PrForReview, root: &Path) -> AppRe
     let run_id = new_run_id();
     let run_dir = state.db_path.parent().unwrap().join("runs").join(&run_id);
     std::fs::create_dir_all(&run_dir)?;
-    let key = card_key(&pr.source_branch, &pr.title);
+    let key = {
+        let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
+        configured_jira_key(&conn, &pr.source_branch, &pr.title)?
+    };
     {
         let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
         let (slug, branch, base) = if pr.local {
@@ -610,6 +624,15 @@ pub async fn fresh_tips(repo: &Path, src_branch: &str, dest_branch: &str) -> App
     Ok((git::run(repo, &["rev-parse", &tip(src_branch)]).await?, git::run(repo, &["rev-parse", &tip(dest_branch)]).await?))
 }
 
+pub async fn github_tips(repo: &Path, number: i64, dest_branch: &str) -> AppResult<(String, String)> {
+    let src_ref = format!("refs/remotes/origin/pr/{number}");
+    let dst_ref = format!("refs/remotes/origin/{dest_branch}");
+    let src_spec = format!("+refs/pull/{number}/head:{src_ref}");
+    let dst_spec = format!("+refs/heads/{dest_branch}:{dst_ref}");
+    git::run(repo, &["fetch", "-q", "origin", &src_spec, &dst_spec]).await?;
+    Ok((git::run(repo, &["rev-parse", &src_ref]).await?, git::run(repo, &["rev-parse", &dst_ref]).await?))
+}
+
 /// `back` se for Laravel (composer.json/artisan na raiz), senão `front` (mesma regra da skill).
 pub fn project_kind(dir: &Path) -> &'static str {
     if dir.join("composer.json").exists() || dir.join("artisan").exists() { "back" } else { "front" }
@@ -728,7 +751,9 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
     ctx.stage("buscando o código do PR (git fetch)");
     // Sempre a ponta atual das branches, não o commit da última atualização da lista:
     // o PR pode ter recebido commits depois dela (PROJ-1503, 2026-11-18).
-    let (src, base) = if pr.local { local_tips(ctx, repo, pr).await? } else { fresh_tips(repo, &pr.source_branch, &pr.dest_branch).await? };
+    let (src, base) = if pr.local { local_tips(ctx, repo, pr).await? }
+        else if pr.provider == "github" { github_tips(repo, pr.bb_id, &pr.dest_branch).await? }
+        else { fresh_tips(repo, &pr.source_branch, &pr.dest_branch).await? };
     if !pr.local && !src.starts_with(&pr.source_sha) {
         ctx.log(&format!(
             "o PR recebeu commits depois da última atualização da lista: revisando {} (a lista tinha {})",
@@ -764,18 +789,20 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
     ctx.log(&format!("worktree no commit {}, projeto {project}, {} conflito(s) com {}", &src[..10.min(src.len())], conflicts.len(), pr.dest_branch));
 
     let card_path = ctx.run_dir.join("card.md");
-    let card_text = if pr.local {
+    let mut card_text = if pr.local {
         format!(
             "# Contexto (branch local, sem PR)\n\n- Repositório: {}\n- Branch: `{}` → `origin/{}`\n- Chave do card: {}\n\n\
-             Não há PR nem descrição: o card do Jira é a spec.\n",
+             {}\n",
             pr.slug,
             pr.source_branch,
             pr.dest_branch,
             key.as_deref().unwrap_or("(não encontrada)"),
+            if key.is_some() { "O card do Jira é a spec." } else { "Sem card configurado: use o diff e as convenções do repositório como contexto; registre hipóteses quando a intenção da mudança não estiver clara." },
         )
     } else {
         format!(
-            "# Contexto do PR (dados do Bitbucket)\n\n- PR: {}#{} — {}\n- Link: {}\n- Branch: `{}` → `{}`\n- Autor: {}\n- Chave do card: {}\n\n## Descrição do PR\n\n{}\n",
+            "# Contexto do PR ({})\n\n- PR: {}#{} — {}\n- Link: {}\n- Branch: `{}` → `{}`\n- Autor: {}\n- Chave do card: {}\n\n## Descrição do PR\n\n{}\n",
+            pr.provider,
             pr.slug,
             pr.bb_id,
             pr.title,
@@ -787,6 +814,24 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
             if pr.description.trim().is_empty() { "(sem descrição)" } else { pr.description.as_str() }
         )
     };
+    if pr.provider == "github" {
+        let mode = {
+            let conn = ctx.state().db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
+            crate::db::get_setting(&conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())
+        };
+        let token = crate::github::token(&mode, ctx.state().secrets.as_ref()).await?;
+        let api = crate::github::Api::new(token)?;
+        for (owner, repo_name, number) in crate::github::issue_refs(&format!("{} {}", pr.title, pr.description), &pr.owner, &pr.slug) {
+            let issue: serde_json::Value = match api.get(&format!("/repos/{owner}/{repo_name}/issues/{number}")).await {
+                Ok(issue) => issue,
+                Err(e) => { ctx.log(&format!("AVISO: não consegui ler a issue {owner}/{repo_name}#{number}: {e}")); continue; }
+            };
+            if issue.get("pull_request").is_some() { continue; }
+            card_text.push_str(&format!("\n## GitHub Issue {owner}/{repo_name}#{number}\n\n{}\n\n{}\n",
+                issue.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
+                issue.get("body").and_then(serde_json::Value::as_str).unwrap_or("")));
+        }
+    }
     std::fs::write(&card_path, card_text)?;
     let mut manifest = json!({
         "projects": [{"project": project, "repo_name": pr.slug, "repo_path": repo, "worktree": wt,
@@ -1542,6 +1587,10 @@ mod tests {
         assert_eq!(card_key("ajuste", "Corrige PROJ-99 e PROJ-100").as_deref(), Some("PROJ-99"));
         assert_eq!(card_key("xPROJ-1", "sem chave").as_deref(), None);
         assert_eq!(card_key("dev", "").as_deref(), None);
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(configured_jira_key(&conn, "PROJ-12", "x").unwrap(), None);
+        db::set_setting(&conn, "jira.site", &json!("acme.atlassian.net")).unwrap();
+        assert_eq!(configured_jira_key(&conn, "PROJ-12", "x").unwrap().as_deref(), Some("PROJ-12"));
     }
 
     #[test]

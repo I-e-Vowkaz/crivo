@@ -187,7 +187,7 @@ fn reviewers_of(pr: &BbPr) -> Vec<Reviewer> {
 pub fn upsert_repo_prs(conn: &mut Connection, ws: &str, slug: &str, prs: &[(BbPr, &str)]) -> AppResult<usize> {
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO repositories (workspace, slug) VALUES (?1, ?2) ON CONFLICT (workspace, slug) DO NOTHING",
+        "INSERT INTO repositories (workspace, slug) VALUES (?1, ?2) ON CONFLICT (provider, workspace, slug) DO NOTHING",
         params![ws, slug],
     )?;
     let repo_id: i64 =

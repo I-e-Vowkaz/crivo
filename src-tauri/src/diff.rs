@@ -56,24 +56,27 @@ pub fn target(conn: &Connection, run_id: &str, view: View) -> AppResult<Target> 
         [run_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     )?;
-    let (slug, cur_base, cur_head) = match pr_id {
+    let (slug, cur_base, cur_head, provider, owner) = match pr_id {
         Some(id) => {
-            let (slug, src, dst): (String, String, String) = conn.query_row(
-                "SELECT r.slug, p.source_branch, p.dest_branch FROM pull_requests p
+            let (slug, src, dst, provider, owner, number): (String, String, String, String, String, i64) = conn.query_row(
+                "SELECT r.slug, p.source_branch, p.dest_branch, r.provider, r.workspace, p.bb_id FROM pull_requests p
                  JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
-            (slug, format!("origin/{dst}"), format!("origin/{src}"))
+            let head = if provider == "github" { format!("origin/pr/{number}") } else { format!("origin/{src}") };
+            (slug, format!("origin/{dst}"), head, provider, owner)
         }
         None => {
             let slug = slug.ok_or_else(|| AppError::Invalid("review sem projeto".into()))?;
             let branch = branch.ok_or_else(|| AppError::Invalid("review sem branch".into()))?;
             let base = base_branch.unwrap_or_else(|| "dev".into());
-            (slug, format!("origin/{base}"), format!("refs/heads/{branch}"))
+            (slug, format!("origin/{base}"), format!("refs/heads/{branch}"), "local".into(), String::new())
         }
     };
-    let repo = crate::branches::repo_dir(&crate::review::repos_root(conn)?, &slug)?;
+    let root = crate::review::repos_root(conn)?;
+    let repo = if provider == "github" { crate::github::clone_path(&root, &owner, &slug) }
+        else { crate::branches::repo_dir(&root, &slug)? };
     let reviewed_head = source_sha.unwrap_or_default();
     let (base, head) = match view {
         View::Reviewed => (dest_sha.unwrap_or_default(), reviewed_head.clone()),

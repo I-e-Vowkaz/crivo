@@ -51,6 +51,8 @@ pub fn messages(conn: &Connection, run_id: &str) -> AppResult<Vec<ChatMessage>> 
 
 struct RunInfo {
     slug: String,
+    provider: String,
+    owner: String,
     bb_id: i64,
     title: String,
     source_branch: String,
@@ -69,7 +71,8 @@ fn load(conn: &Connection, run_id: &str) -> AppResult<RunInfo> {
         .query_row(
             "SELECT coalesce(r.slug, rr.repo_slug), ifnull(p.bb_id, 0), coalesce(p.title, rr.branch),
                     coalesce(p.source_branch, rr.branch), coalesce(p.dest_branch, rr.base_branch), rr.source_sha,
-                    rr.dest_sha, rr.card_key, rr.run_dir, rr.chat_session_id, rr.status
+                    rr.dest_sha, rr.card_key, rr.run_dir, rr.chat_session_id, rr.status,
+                    ifnull(r.provider, 'local'), ifnull(r.workspace, '')
              FROM review_runs rr LEFT JOIN pull_requests p ON p.id = rr.pr_id LEFT JOIN repositories r ON r.id = p.repository_id
              WHERE rr.id = ?1",
             [run_id],
@@ -78,6 +81,8 @@ fn load(conn: &Connection, run_id: &str) -> AppResult<RunInfo> {
                 Ok((
                     RunInfo {
                         slug: r.get(0)?,
+                        provider: r.get(11)?,
+                        owner: r.get(12)?,
                         bb_id: r.get(1)?,
                         title: r.get(2)?,
                         source_branch: r.get(3)?,
@@ -110,6 +115,7 @@ fn load(conn: &Connection, run_id: &str) -> AppResult<RunInfo> {
         .query_map([run_id], |r| Ok(format!("- [{}] {}: {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
         .collect::<Result<_, _>>()?;
     info.jira_site = super::jira_site(conn)?;
+    if info.jira_site.is_none() { info.card_key = None; }
     Ok(info)
 }
 
@@ -241,7 +247,7 @@ async fn answer(
         let _ = app.emit("chat-update", ChatEvent { run_id, line: Some(line), busy: true });
     };
     // worktree do chat no commit revisado (o do review já foi removido)
-    let repo = root.join(&info.slug);
+    let repo = if info.provider == "github" { crate::github::clone_path(root, &info.owner, &info.slug) } else { root.join(&info.slug) };
     let wt = info.run_dir.join("chat-wt");
     if !wt.join(".git").exists() {
         log("preparando o código do commit revisado");
@@ -265,7 +271,7 @@ async fn answer(
         }
     };
     let mut allowed = READ_ONLY_TOOLS.replace("Agent ", "");
-    allowed.push_str(" ToolSearch mcp__atlassian__getJiraIssue");
+    if info.card_key.is_some() { allowed.push_str(" ToolSearch mcp__atlassian__getJiraIssue"); }
     let mut opts: Vec<String> = vec![
         "--model".into(), "sonnet".into(), "--effort".into(), "medium".into(),
         "--add-dir".into(), info.run_dir.display().to_string(),
@@ -277,7 +283,7 @@ async fn answer(
         opts.extend(["--add-dir".into(), r.dir.display().to_string()]);
     }
     // sem cache de 5 min: a próxima pergunta pode vir bem depois e reaproveita o de 1 h
-    opts.extend(worker_config(false, true));
+    opts.extend(worker_config(false, info.card_key.is_some()));
     opts.extend(super::writing_style_opts());
     let spec = Spec {
         session,
@@ -338,6 +344,8 @@ mod tests {
     fn primeira_pergunta_leva_o_contexto() {
         let info = RunInfo {
             slug: "acme-back".into(),
+            provider: "bitbucket".into(),
+            owner: "acme".into(),
             bb_id: 2397,
             title: "PROJ-1503".into(),
             source_branch: "PROJ-1503".into(),

@@ -19,6 +19,7 @@ const MAX_LEN: usize = 4096;
 pub enum SecretKind {
     Bitbucket,
     Jira,
+    Github,
 }
 
 impl SecretKind {
@@ -26,6 +27,7 @@ impl SecretKind {
         match self {
             SecretKind::Bitbucket => "bitbucket",
             SecretKind::Jira => "jira",
+            SecretKind::Github => "github",
         }
     }
     /// Conta no keyring. Fixa por tipo: há um token de cada.

@@ -128,7 +128,7 @@ pub(super) async fn run(
         "--model".into(), "haiku".into(), "--effort".into(), "low".into(), "--chrome".into(),
         "--json-schema".into(), std::fs::read_to_string(assets().join("schemas/browser-results.json"))?,
         "--add-dir".into(), ctx.run_dir.display().to_string(),
-        "--allowedTools".into(), "mcp__claude-in-chrome__* ToolSearch mcp__atlassian__getJiraIssue Read".into(),
+        "--allowedTools".into(), if card_key.is_some() { "mcp__claude-in-chrome__* ToolSearch mcp__atlassian__getJiraIssue Read" } else { "mcp__claude-in-chrome__* Read" }.into(),
         "--disallowedTools".into(),
         "Edit Write NotebookEdit Agent mcp__claude-in-chrome__file_upload mcp__claude-in-chrome__upload_image".into(),
         "--max-turns".into(), "60".into(), "--max-budget-usd".into(), "3".into(),
