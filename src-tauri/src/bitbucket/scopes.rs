@@ -1,5 +1,6 @@
 //! Escopos do API token, lidos do header `X-Oauth-Scopes` (achado 14 da Fase 0).
-//! Leitura obrigatória; escrita em PR é opcional para publicar comentários.
+//! O app só aceita token **somente leitura** com os três escopos que usa: o Crivo não escreve no
+//! Bitbucket.
 
 use serde::Serialize;
 
@@ -11,7 +12,7 @@ pub struct ScopeCheck {
     pub scopes: Vec<String>,
     /// Dos obrigatórios, os que faltam.
     pub missing: Vec<String>,
-    /// Escopos além da leitura e da escrita em PRs.
+    /// Qualquer escopo que não seja de leitura (`write:`, `admin:`, `delete:`...).
     pub forbidden: Vec<String>,
 }
 
@@ -45,7 +46,7 @@ pub fn check(scopes: &[String]) -> ScopeCheck {
     ScopeCheck {
         scopes: scopes.to_vec(),
         missing: REQUIRED.iter().filter(|r| !bases.contains(r)).map(|r| (*r).to_owned()).collect(),
-        forbidden: scopes.iter().filter(|s| !s.starts_with("read:") && base(s) != "write:pullrequest").cloned().collect(),
+        forbidden: scopes.iter().filter(|s| !s.starts_with("read:")).cloned().collect(),
     }
 }
 
@@ -67,14 +68,11 @@ mod tests {
     }
 
     #[test]
-    fn escrita_em_pr_e_aceita() {
-        let s = parse(Some(
-            "read:repository:bitbucket, read:pullrequest:bitbucket, read:user:bitbucket, write:pullrequest:bitbucket",
-        ))
-        .unwrap();
+    fn escopo_de_escrita_e_recusado() {
+        let s = parse(Some("read:pullrequest:bitbucket, read:repository:bitbucket, read:user:bitbucket, write:pullrequest:bitbucket")).unwrap();
         let c = check(&s);
-        assert!(c.ok());
-        assert!(c.forbidden.is_empty());
+        assert!(!c.ok());
+        assert_eq!(c.forbidden, vec!["write:pullrequest:bitbucket"]);
         assert!(c.missing.is_empty());
     }
 

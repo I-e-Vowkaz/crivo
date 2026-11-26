@@ -32,7 +32,7 @@ pub struct Account {
     pub validated_at: Option<String>,
 }
 
-/// Confere o token contra a API: leitura obrigatória e escrita em PR opcional.
+/// Confere o token contra a API: só leitura, com os três escopos que o app usa.
 /// Não grava nada: quem chama decide se salva.
 pub async fn validate(client: &Client, workspace: &str) -> AppResult<Account> {
     let r = client.get_json::<User>("/user", &[]).await?;
@@ -75,7 +75,7 @@ fn scope_error(c: &ScopeCheck) -> String {
     if !c.missing.is_empty() {
         parts.push(format!("faltam os escopos {}", c.missing.join(", ")));
     }
-    format!("{}. Use read:pullrequest, read:repository e read:user; write:pullrequest é opcional para publicar", parts.join("; "))
+    format!("{}. Crie um token só de leitura, com read:pullrequest, read:repository e read:user", parts.join("; "))
 }
 
 /// Email e workspace salvos nas configurações; erro claro se faltarem.
@@ -135,6 +135,15 @@ pub fn forget_account(conn: &Connection) -> AppResult<()> {
 mod tests {
     use super::client::testserver::{Canned, ok, start};
     use super::*;
+
+    #[test]
+    fn erro_de_escopo_pede_so_leitura() {
+        let c = scopes::check(&["read:pullrequest", "read:repository", "read:user", "write:pullrequest:bitbucket"].map(String::from));
+        let msg = scope_error(&c);
+        assert!(msg.contains("write:pullrequest:bitbucket"), "{msg}");
+        assert!(msg.ends_with("Crie um token só de leitura, com read:pullrequest, read:repository e read:user"), "{msg}");
+        assert!(!msg.contains("opcional"), "{msg}");
+    }
     use crate::secrets::{self, MemoryStore, SecretKind};
     use serde_json::json;
 

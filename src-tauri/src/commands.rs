@@ -11,6 +11,7 @@ use tauri::{Emitter, State};
 use crate::bitbucket::{self, Account, client::Client};
 use crate::db;
 use crate::github;
+use crate::hosting;
 use crate::review;
 use crate::error::{AppError, AppResult};
 use crate::secrets::{self, KeyringStore, SecretKind, SecretStore};
@@ -174,24 +175,9 @@ pub fn setting_set(state: State<'_, AppState>, key: String, value: Value) -> App
 
 // ---------------- PRs ----------------
 
-/// Repositórios monitorados: `bitbucket.repos` (lista ou texto separado por vírgula).
-fn monitored_repos(conn: &Connection) -> AppResult<Vec<String>> {
-    let v = db::get_setting(conn, "bitbucket.repos")?.unwrap_or(Value::Null);
-    let list: Vec<String> = match v {
-        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-        Value::String(s) => s.split(',').map(str::to_owned).collect(),
-        _ => vec![],
-    };
-    let list: Vec<String> = list.into_iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
-    if list.is_empty() {
-        return Err(AppError::Invalid("informe os repositórios monitorados nas Configurações".into()));
-    }
-    Ok(list)
-}
-
-/// Busca no Bitbucket os PRs abertos em que sou reviewer ou autor, em todos os repos monitorados.
+/// Busca nos provedores os PRs abertos em que sou reviewer ou autor, em todos os repos monitorados.
 #[tauri::command]
-pub async fn sync_prs(state: State<'_, AppState>) -> AppResult<bitbucket::sync::SyncResult> {
+pub async fn sync_prs(state: State<'_, AppState>) -> AppResult<hosting::SyncResult> {
     sync_all(&state.db, state.secrets.as_ref()).await
 }
 
@@ -199,136 +185,34 @@ fn lock(db: &Mutex<Connection>) -> AppResult<std::sync::MutexGuard<'_, Connectio
     db.lock().map_err(|_| AppError::Invalid("conexão com o banco indisponível".into()))
 }
 
-/// O sync em si: usado pela tela e pelo modo sem janela (`--sync`, timer das 10h).
-pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
-    let has_bitbucket = {
-        let conn = lock(db)?;
-        db::get_setting(&conn, "bitbucket.workspace")?.and_then(|v| v.as_str().map(str::to_owned)).is_some_and(|s| !s.trim().is_empty())
-    };
-    let mut result = bitbucket::sync::SyncResult { user: String::new(), repos: Vec::new(), requests: 0 };
-    if has_bitbucket {
-        match sync_bitbucket(db, store).await {
-            Ok(r) => result = r,
-            Err(e) => result.repos.push(bitbucket::sync::RepoSync {
-                slug: "Bitbucket".into(), open: 0, error: Some(e.to_string()), fetch_error: None,
-            }),
-        }
-    }
-    let (repos, mode, root) = {
-        let conn = lock(db)?;
-        let repos = github::configured_repos(db::get_setting(&conn, "github.repos")?)?;
-        let mode = db::get_setting(&conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into());
-        let root = review::repos_root(&conn)?;
-        (repos, mode, root)
-    };
-    if !repos.is_empty() {
-        let auth = async {
-            let token = github::token(&mode, store).await?;
-            let api = github::Api::new(token)?;
-            let me: github::User = api.get("/user").await?;
-            Ok::<_, AppError>((api, me))
-        }.await;
-        let (api, me) = match auth {
-            Ok(pair) => pair,
-            Err(e) => {
-                result.repos.extend(repos.into_iter().map(|(owner, name)| bitbucket::sync::RepoSync {
-                    slug: format!("{owner}/{name}"), open: 0, error: Some(format!("GitHub: {e}")), fetch_error: None,
-                }));
-                return Ok(result);
-            }
-        };
-        let sync_id = {
-            let conn = lock(db)?;
-            conn.execute("INSERT INTO sync_runs (kind, status) VALUES ('full', 'running')", [])?;
-            conn.last_insert_rowid()
-        };
-        {
-            let conn = lock(db)?;
-            db::set_setting(&conn, "github.me", &serde_json::json!({"login": me.login, "id": me.id}))?;
-        }
-        if result.user.is_empty() { result.user = me.login.clone(); }
-        for (owner, name) in repos {
-            let fetched = api.pulls(&owner, &name).await;
-            let (open, error) = match fetched {
-                Ok(pulls) => {
-                    // `sync` também consulta os reviews de cada PR.
-                    match github::sync_repo(db, &api, &me, &owner, &name, pulls).await {
-                        Ok(n) => (n, None), Err(e) => (0, Some(e.to_string()))
-                    }
-                }
-                Err(e) => (0, Some(e.to_string())),
-            };
-            let clone = github::clone_path(&root, &owner, &name);
-            let fetch_error = if clone.join(".git").exists() {
-                review::git::run(&clone, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string())
-            } else { Some(format!("clone local não encontrado em {}", clone.display())) };
-            result.repos.push(bitbucket::sync::RepoSync { slug: format!("{owner}/{name}"), open, error, fetch_error });
-        }
-        let failed = result.repos.iter().filter_map(|r| r.error.as_ref()).cloned().collect::<Vec<_>>();
-        result.requests += api.requests();
-        lock(db)?.execute("UPDATE sync_runs SET status = ?1, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), error = ?2, requests = ?3 WHERE id = ?4",
-            rusqlite::params![if failed.is_empty() { "completed" } else { "failed" }, (!failed.is_empty()).then(|| failed.join("; ")), api.requests(), sync_id])?;
-    }
-    if !has_bitbucket && result.repos.is_empty() {
+/// O sync em si: usado pela tela e pelo modo sem janela (`--sync`, timer das 10h). Cada provedor
+/// configurado vem da factory; a falha de um vira uma linha de erro e não impede o outro.
+pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<hosting::SyncResult> {
+    let kinds = hosting::Provider::configured(&*lock(db)?)?;
+    if kinds.is_empty() {
         return Err(AppError::Invalid("configure ao menos um repositório Bitbucket ou GitHub".into()));
     }
-    Ok(result)
-}
-
-async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
-    let (email, workspace, repos) = {
-        let conn = lock(db)?;
-        let (email, workspace) = bitbucket::account_settings(&conn)?;
-        (email, workspace, monitored_repos(&conn)?)
-    };
-    let token = store
-        .get(&SecretKind::Bitbucket.account())?
-        .ok_or_else(|| AppError::Invalid("salve o token do Bitbucket nas Configurações".into()))?;
-    let client = Client::new(&email, &token)?;
-    let me: bitbucket::User = client.get_json("/user", &[]).await?.body;
-    // quem sou eu, para marcar os PRs que já aprovei
-    db::set_setting(&*lock(db)?, "bitbucket.me", &serde_json::json!({"uuid": me.uuid, "display_name": me.display_name}))?;
-
-    let sync_id: i64 = {
-        let conn = lock(db)?;
-        conn.execute("INSERT INTO sync_runs (kind, status) VALUES ('full', 'running')", [])?;
-        conn.last_insert_rowid()
-    };
-    let mut out = Vec::new();
-    let root = review::repos_root(&*lock(db)?)?;
-    for slug in repos {
-        let fetched = bitbucket::sync::fetch_repo(&client, &workspace, &slug, &me.uuid).await;
-        let (open, error) = match fetched {
-            Ok(prs) => {
-                let mut conn = lock(db)?;
-                (bitbucket::sync::upsert_repo_prs(&mut conn, &workspace, &slug, &prs)?, None)
+    let mut result = hosting::SyncResult { user: String::new(), repos: Vec::new(), requests: 0 };
+    for kind in kinds {
+        let provider = match hosting::Provider::connect(kind, db, store).await {
+            Ok(p) => p,
+            Err(e) => {
+                result.repos.push(hosting::RepoSync { slug: kind.name().into(), open: 0, error: Some(e.to_string()), fetch_error: None });
+                continue;
             }
-            Err(e) => (0, Some(e.to_string())),
         };
-        // o clone local também recebe as branches novas (o Checkout não acessa a rede)
-        let clone = root.join(&slug);
-        let fetch_error = if clone.join(".git").exists() {
-            review::git::run(&clone, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string())
-        } else {
-            Some(format!("clone local não encontrado em {}", clone.display()))
-        };
-        out.push(bitbucket::sync::RepoSync { slug, open, error, fetch_error });
+        match provider.sync(db).await {
+            Ok((user, repos)) => {
+                if result.user.is_empty() {
+                    result.user = user;
+                }
+                result.repos.extend(repos);
+            }
+            Err(e) => result.repos.push(hosting::RepoSync { slug: kind.name().into(), open: 0, error: Some(e.to_string()), fetch_error: None }),
+        }
+        result.requests += provider.requests();
     }
-    let failed: Vec<String> = out.iter().filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.slug))).collect();
-    {
-        let conn = lock(db)?;
-        conn.execute(
-            "UPDATE sync_runs SET status = ?1, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), requests = ?2, error = ?3
-             WHERE id = ?4",
-            rusqlite::params![
-                if failed.is_empty() { "completed" } else { "failed" },
-                client.requests(),
-                (!failed.is_empty()).then(|| failed.join("; ")),
-                sync_id
-            ],
-        )?;
-    }
-    Ok(bitbucket::sync::SyncResult { user: me.display_name, repos: out, requests: client.requests() })
+    Ok(result)
 }
 
 #[derive(Serialize)]
@@ -392,10 +276,10 @@ pub fn list_prs(state: State<'_, AppState>) -> AppResult<PrList> {
 
 /// As listas do app ("Para eu revisar" e "Meus PRs"), também usadas pelo `prs` do terminal.
 pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
-    let me: Option<String> = db::get_setting(&conn, "bitbucket.me")?
-        .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned));
-    let github_me: Option<String> = db::get_setting(&conn, "github.me")?
-        .and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned));
+    let ids = [hosting::Kind::Bitbucket, hosting::Kind::Github]
+        .into_iter()
+        .map(|k| Ok((k, hosting::me(conn, k)?)))
+        .collect::<AppResult<std::collections::HashMap<_, _>>>()?;
     let mut stmt = conn.prepare(
         "SELECT p.id, r.slug, p.bb_id, p.title, p.url, p.author_name, p.category, p.changes_requested,
                 p.changed_since_sync, p.reviewers_json, p.source_branch, p.dest_branch, p.updated_on,
@@ -428,9 +312,8 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
         .query_map([], |r| {
             let reviewers: Vec<bitbucket::sync::Reviewer> =
                 serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
-            let provider: String = r.get(26)?;
-            let identity = if provider == "github" { &github_me } else { &me };
-            let approved_by_me = identity.as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
+            let rr = hosting::RepoRef::from_row(&r.get::<_, String>(26)?, r.get(27)?, r.get(1)?)?;
+            let approved_by_me = ids[&rr.kind].as_ref().is_some_and(|m| reviewers.iter().any(|x| x.approved && x.uuid.as_ref() == Some(m)));
             let run_id: Option<String> = r.get(13)?;
             let reviewed: Option<String> = r.get(21)?;
             let current: String = r.get(22)?;
@@ -438,8 +321,8 @@ pub fn pr_list(conn: &Connection) -> AppResult<PrList> {
             Ok(PrView {
                 id: r.get(0)?,
                 repo: r.get(1)?,
-                provider,
-                owner: r.get(27)?,
+                provider: rr.kind.as_str().to_owned(),
+                owner: rr.owner,
                 bb_id: r.get(2)?,
                 title: r.get(3)?,
                 url: r.get(4)?,
@@ -744,26 +627,19 @@ pub struct CheckoutResult {
 /// Recusa se houver alteração não commitada ou se a branch local divergiu.
 #[tauri::command]
 pub async fn checkout_pr(state: State<'_, AppState>, pr_id: i64) -> AppResult<CheckoutResult> {
-    let (slug, mut branch, sha, root, provider, number, owner) = {
+    let (rr, branch, sha, number, root) = {
         let conn = state.conn()?;
-        let (slug, branch, sha, provider, number, owner): (String, String, String, String, i64, String) = conn.query_row(
-            "SELECT r.slug, p.source_branch, p.source_sha, r.provider, p.bb_id, r.workspace FROM pull_requests p
+        let (rr, branch, sha, number): (hosting::RepoRef, String, String, i64) = conn.query_row(
+            "SELECT r.provider, r.workspace, r.slug, p.source_branch, p.source_sha, p.bb_id FROM pull_requests p
              JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
             [pr_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((hosting::RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-        (slug, branch, sha, review::repos_root(&conn)?, provider, number, owner)
+        (rr, branch, sha, number, review::repos_root(&conn)?)
     };
-    let repo = if provider == "github" { github::clone_path(&root, &owner, &slug) } else { root.join(&slug) };
-    if !repo.join(".git").exists() {
-        return Err(AppError::Invalid(format!("não achei o clone de {slug} em {}", repo.display())));
-    }
-    let head = if provider == "github" {
-        let (local, head) = review::git::checkout_github(&repo, number).await?;
-        branch = local;
-        head
-    } else { review::git::checkout_synced(&repo, &slug, &branch).await? };
-    Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: slug, branch, head })
+    let repo = rr.clone_dir(&root)?;
+    let (branch, head) = rr.checkout(&repo, number, &branch).await?;
+    Ok(CheckoutResult { at_pr_commit: head.starts_with(&sha) || sha.starts_with(&head), repo: rr.slug, branch, head })
 }
 
 // ---------------- Chat sobre o review ----------------

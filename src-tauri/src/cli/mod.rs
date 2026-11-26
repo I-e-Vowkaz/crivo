@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
+use crate::hosting::RepoRef;
 use crate::commands::{self, AppState};
 use crate::error::{AppError, AppResult};
 use crate::review::{self, CliHost, Host};
@@ -96,18 +97,15 @@ fn open_prs(conn: &Connection, branch: &str, repo: Option<&str>) -> AppResult<Ve
     let mut stmt = conn.prepare(
         "SELECT p.id, r.slug, p.bb_id, p.title, p.url, r.provider, r.workspace FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
          WHERE p.state = 'OPEN' AND lower(p.source_branch) = lower(?1)
-           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))
          ORDER BY r.provider, r.workspace, r.slug",
     )?;
-    let rows = stmt.query_map(params![branch, repo], |r| {
-        let slug: String = r.get(1)?;
-        let bb_id: i64 = r.get(2)?;
-        let provider: String = r.get(5)?;
-        let owner: String = r.get(6)?;
-        let label = if provider == "github" { format!("{owner}/{slug}#{bb_id}") } else { format!("{slug}#{bb_id}") };
-        Ok(Target::Pr { id: r.get(0)?, label, title: r.get(3)?, url: r.get(4)? })
+    let rows = stmt.query_map(params![branch], |r| {
+        let rr = RepoRef::from_row(&r.get::<_, String>(5)?, r.get(6)?, r.get(1)?)?;
+        let target = Target::Pr { id: r.get(0)?, label: rr.label(r.get(2)?), title: r.get(3)?, url: r.get(4)? };
+        Ok((rr, target))
     })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let all: Vec<(RepoRef, Target)> = rows.collect::<Result<_, _>>()?;
+    Ok(all.into_iter().filter(|(rr, _)| repo.is_none_or(|f| rr.matches(f))).map(|(_, t)| t).collect())
 }
 
 /// Branch local com esse nome (sem diferenciar maiúsculas) nos clones da pasta configurada.

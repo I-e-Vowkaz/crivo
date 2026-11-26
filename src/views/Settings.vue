@@ -235,7 +235,7 @@ onMounted(load);
         <button v-if="tokenSaved" type="button" class="secondary" :disabled="busy" @click="deleteToken">Remover</button>
       </form>
       <p class="muted small">
-        Leitura: <code>read:pullrequest</code>, <code>read:repository</code>, <code>read:user</code>. Para publicar, adicione <code>write:pullrequest</code>. Fica no
+        Somente leitura: <code>read:pullrequest</code>, <code>read:repository</code>, <code>read:user</code>. O app recusa token com escopo de escrita. Fica no
         cofre do sistema e nunca volta para esta tela.
       </p>
     </div>

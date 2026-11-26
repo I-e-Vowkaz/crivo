@@ -56,27 +56,25 @@ pub fn target(conn: &Connection, run_id: &str, view: View) -> AppResult<Target> 
         [run_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     )?;
-    let (slug, cur_base, cur_head, provider, owner) = match pr_id {
+    let root = crate::review::repos_root(conn)?;
+    let (repo, cur_base, cur_head) = match pr_id {
         Some(id) => {
-            let (slug, src, dst, provider, owner, number): (String, String, String, String, String, i64) = conn.query_row(
-                "SELECT r.slug, p.source_branch, p.dest_branch, r.provider, r.workspace, p.bb_id FROM pull_requests p
+            let (rr, src, dst, number): (crate::hosting::RepoRef, String, String, i64) = conn.query_row(
+                "SELECT r.provider, r.workspace, r.slug, p.source_branch, p.dest_branch, p.bb_id FROM pull_requests p
                  JOIN repositories r ON r.id = p.repository_id WHERE p.id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| Ok((crate::hosting::RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
-            let head = if provider == "github" { format!("origin/pr/{number}") } else { format!("origin/{src}") };
-            (slug, format!("origin/{dst}"), head, provider, owner)
+            let repo = rr.clone_dir(&root)?;
+            (repo, format!("origin/{dst}"), rr.head_ref(number, &src))
         }
         None => {
             let slug = slug.ok_or_else(|| AppError::Invalid("review sem projeto".into()))?;
             let branch = branch.ok_or_else(|| AppError::Invalid("review sem branch".into()))?;
             let base = base_branch.unwrap_or_else(|| "dev".into());
-            (slug, format!("origin/{base}"), format!("refs/heads/{branch}"), "local".into(), String::new())
+            (crate::branches::repo_dir(&root, &slug)?, format!("origin/{base}"), format!("refs/heads/{branch}"))
         }
     };
-    let root = crate::review::repos_root(conn)?;
-    let repo = if provider == "github" { crate::github::clone_path(&root, &owner, &slug) }
-        else { crate::branches::repo_dir(&root, &slug)? };
     let reviewed_head = source_sha.unwrap_or_default();
     let (base, head) = match view {
         View::Reviewed => (dest_sha.unwrap_or_default(), reviewed_head.clone()),
@@ -476,7 +474,8 @@ index 1111111..2222222 100644
         let root = std::env::temp_dir().join(format!("prr-dview-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let (origin, author, user) = (root.join("o.git"), root.join("a"), root.join("r"));
+        // o origin termina em `w/r`, o repositório do banco: o app confere isso antes de usar o clone
+        let (origin, author, user) = (root.join("w").join("r.git"), root.join("a"), root.join("r"));
         g(&root, &["init", "-q", "--bare", origin.to_str().unwrap()]);
         g(&root, &["clone", "-q", origin.to_str().unwrap(), author.to_str().unwrap()]);
         std::fs::write(author.join("f.txt"), "1\n").unwrap();

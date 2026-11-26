@@ -1,14 +1,13 @@
-//! Publicação explícita de achados validados em comentários de PR.
-use reqwest::Method;
-use rusqlite::{OptionalExtension, params};
+//! Publicação explícita de achados validados num review do PR. Só no GitHub: o Crivo não
+//! escreve no Bitbucket (`hosting::Kind::can_write`).
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::State;
 
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
-use crate::github;
-use crate::secrets::SecretKind;
+use crate::hosting::{Provider, RepoRef};
 
 #[derive(Serialize)]
 pub struct Published {
@@ -28,6 +27,26 @@ struct Finding {
     in_diff: bool,
 }
 
+/// O PR de um review concluído (repositório, número e commit revisado), se o provedor aceita
+/// escrita. Recusa antes de qualquer chamada à API.
+fn writable_target(conn: &Connection, run_id: &str) -> AppResult<(RepoRef, i64, String)> {
+    let (rr, number, sha) = conn
+        .query_row(
+            "SELECT pvd.provider, pvd.workspace, pvd.slug, p.bb_id, rr.source_sha
+             FROM review_runs rr JOIN pull_requests p ON p.id = rr.pr_id
+             JOIN repositories pvd ON pvd.id = p.repository_id
+             WHERE rr.id = ?1 AND rr.status = 'completed'",
+            [run_id],
+            |r| Ok((RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Invalid("review concluído não encontrado".into()))?;
+    if !rr.kind.can_write() {
+        return Err(AppError::Invalid(format!("o Crivo não escreve no {}", rr.kind.name())));
+    }
+    Ok((rr, number, sha))
+}
+
 #[tauri::command]
 pub async fn publish_findings(
     state: State<'_, AppState>,
@@ -42,22 +61,9 @@ pub async fn publish_findings(
     let mut seqs = seqs;
     seqs.sort_unstable();
     seqs.dedup();
-    let (provider, owner, repo, number, sha, findings, mut already) = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-        let meta: (String, String, String, i64, String) = conn
-            .query_row(
-                "SELECT pvd.provider, pvd.workspace, pvd.slug, p.bb_id, rr.source_sha
-             FROM review_runs rr JOIN pull_requests p ON p.id = rr.pr_id
-             JOIN repositories pvd ON pvd.id = p.repository_id
-             WHERE rr.id = ?1 AND rr.status = 'completed'",
-                [&run_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?
-            .ok_or_else(|| AppError::Invalid("review concluído não encontrado".into()))?;
+    let (rr, number, sha, findings, mut already) = {
+        let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
+        let (rr, number, sha) = writable_target(&conn, &run_id)?;
         let mut findings = Vec::new();
         let mut already = Vec::new();
         for seq in &seqs {
@@ -74,7 +80,7 @@ pub async fn publish_findings(
             }
             findings.push(f);
         }
-        (meta.0, meta.1, meta.2, meta.3, meta.4, findings, already)
+        (rr, number, sha, findings, already)
     };
     if findings.is_empty() {
         return Ok(already);
@@ -113,258 +119,68 @@ pub async fn publish_findings(
                 .join("\n\n")
             })
     };
-    if provider == "github" {
-        let mode = {
-            let conn = state
-                .db
-                .lock()
-                .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-            crate::db::get_setting(&conn, "github.auth_mode")?
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "gh".into())
-        };
-        let api = github::Api::new(github::token(&mode, state.secrets.as_ref()).await?)?;
-        let current: Value = api
-            .get(&format!("/repos/{owner}/{repo}/pulls/{number}"))
-            .await?;
-        if current.get("state").and_then(Value::as_str) != Some("open") {
-            return Err(AppError::Invalid("a PR já não está aberta".into()));
-        }
-        if current.pointer("/head/sha").and_then(Value::as_str) != Some(sha.as_str()) {
-            return Err(AppError::Invalid(
-                "a PR recebeu novos commits; revise novamente antes de publicar".into(),
-            ));
-        }
-        let inline: Vec<Value> = findings
-            .iter()
-            .filter_map(|f| match (&f.file, f.line, f.in_diff) {
-                (Some(file), Some(line), true) if line > 0 => {
-                    Some(json!({"path": file, "line": line, "side": "RIGHT", "body": body(f)}))
-                }
-                _ => None,
-            })
-            .collect();
-        let summary = findings
-            .iter()
-            .filter(|f| f.file.is_none() || f.line.is_none() || !f.in_diff)
-            .map(|f| format!("- {}: {}", f.title, f.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let marker = format!(
-            "<!-- crivo:{run_id}:{} -->",
-            findings
-                .iter()
-                .map(|f| f.seq.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let review_body = format!("Review do Crivo (execução {run_id}).\n\n{summary}\n\n{marker}");
-        let me: github::User = api.get("/user").await?;
-        let mut prior: Option<Value> = None;
-        for page in 1..=100 {
-            let reviews: Vec<Value> = api
-                .get(&format!(
-                    "/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100&page={page}"
-                ))
-                .await?;
-            let last = reviews.len() < 100;
-            prior = reviews.into_iter().find(|r| {
-                r.pointer("/user/login").and_then(Value::as_str) == Some(me.login.as_str())
-                    && r.get("body")
-                        .and_then(Value::as_str)
-                        .is_some_and(|b| b.contains(&marker))
-            });
-            if prior.is_some() || last {
-                break;
-            }
-        }
-        let response: Value = if let Some(prior) = prior {
-            prior
-        } else {
-            api.request(Method::POST, &format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
-                Some(&json!({"commit_id": sha, "event": if request_changes { "REQUEST_CHANGES" } else { "COMMENT" }, "body": review_body, "comments": inline}))).await?
-        };
-        let remote = response
-            .get("id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| AppError::Invalid("GitHub não devolveu ID do review".into()))?
-            .to_string();
-        let url = response
-            .get("html_url")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-        for f in &findings {
-            conn.execute("INSERT OR IGNORE INTO published_findings (run_id, finding_seq, remote_id, remote_url) VALUES (?1,?2,?3,?4)", params![run_id, f.seq, remote, url])?;
-        }
-        already.extend(findings.into_iter().map(|f| Published {
-            seq: f.seq,
-            url: url.clone(),
-        }));
-        return Ok(already);
-    }
-    if request_changes {
-        return Err(AppError::Invalid(
-            "Bitbucket aceita apenas comentários neste fluxo".into(),
-        ));
-    }
-    let token = state
-        .secrets
-        .get(&SecretKind::Bitbucket.account())?
-        .ok_or_else(|| AppError::Invalid("token Bitbucket ausente".into()))?;
-    let scopes: Vec<String> = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-        conn.query_row(
-            "SELECT scopes_json FROM credentials WHERE kind = 'bitbucket'",
-            [],
-            |r| r.get::<_, Option<String>>(0),
-        )?
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-    };
-    if !scopes
+    let inline: Vec<Value> = findings
         .iter()
-        .any(|s| s == "write:pullrequest" || s == "write:pullrequest:bitbucket")
-    {
-        return Err(AppError::Invalid(
-            "o token Bitbucket precisa do escopo write:pullrequest para publicar".into(),
-        ));
-    }
-    let email = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-        crate::db::get_setting(&conn, "bitbucket.email")?
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default()
-    };
-    let bb = crate::bitbucket::client::Client::new(&email, &token)?;
-    let current: Value = bb
-        .get_json(
-            &format!("/repositories/{owner}/{repo}/pullrequests/{number}"),
-            &[],
-        )
-        .await?
-        .body;
-    if current.get("state").and_then(Value::as_str) != Some("OPEN") {
-        return Err(AppError::Invalid("a PR já não está aberta".into()));
-    }
-    if current
-        .pointer("/source/commit/hash")
-        .and_then(Value::as_str)
-        != Some(sha.as_str())
-    {
-        return Err(AppError::Invalid(
-            "a PR recebeu novos commits; revise novamente antes de publicar".into(),
-        ));
-    }
-    let http = reqwest::Client::new();
-    let endpoint = format!(
-        "https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/pullrequests/{number}/comments"
+        .filter_map(|f| match (&f.file, f.line, f.in_diff) {
+            (Some(file), Some(line), true) if line > 0 => Some(json!({"path": file, "line": line, "side": "RIGHT", "body": body(f)})),
+            _ => None,
+        })
+        .collect();
+    let summary = findings
+        .iter()
+        .filter(|f| f.file.is_none() || f.line.is_none() || !f.in_diff)
+        .map(|f| format!("- {}: {}", f.title, f.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let marker = format!(
+        "<!-- crivo:{run_id}:{} -->",
+        findings.iter().map(|f| f.seq.to_string()).collect::<Vec<_>>().join(",")
     );
-    let mut remote_comments = Vec::new();
-    for page in 1..=100 {
-        let res = http
-            .get(&endpoint)
-            .basic_auth(&email, Some(&token))
-            .query(&[("pagelen", "100"), ("page", &page.to_string())])
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::Invalid(format!(
-                    "não consegui conferir comentários Bitbucket existentes: {e}"
-                ))
-            })?;
-        if !res.status().is_success() {
-            return Err(AppError::Invalid(format!(
-                "Bitbucket HTTP {} ao conferir duplicatas",
-                res.status()
-            )));
-        }
-        let data: Value = res
-            .json()
-            .await
-            .map_err(|e| AppError::Invalid(format!("resposta Bitbucket inválida: {e}")))?;
-        let Some(values) = data.get("values").and_then(Value::as_array) else {
-            break;
-        };
-        let last = values.len() < 100;
-        remote_comments.extend(values.iter().cloned());
-        if last {
-            break;
-        }
-    }
-    let mut published = already;
+    let review_body = format!("Review do Crivo (execução {run_id}).\n\n{summary}\n\n{marker}");
+    let provider = Provider::connect(rr.kind, &state.db, state.secrets.as_ref()).await?;
+    let (remote, url) = provider.publish(&rr, number, &sha, &review_body, &marker, &inline, request_changes).await?;
+    let conn = state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
     for f in &findings {
-        let marker = format!("<!-- crivo:{run_id}:{} -->", f.seq);
-        if let Some(old) = remote_comments.iter().find(|c| {
-            c.pointer("/content/raw")
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.contains(&marker))
-        }) {
-            let id = old
-                .get("id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| AppError::Invalid("comentário Bitbucket sem ID".into()))?
-                .to_string();
-            let url = old
-                .pointer("/links/html/href")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            state.db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?
-                .execute("INSERT OR IGNORE INTO published_findings (run_id, finding_seq, remote_id, remote_url) VALUES (?1,?2,?3,?4)", params![run_id, f.seq, id, url])?;
-            published.push(Published { seq: f.seq, url });
-            continue;
-        }
-        let mut payload = json!({"content": {"raw": format!("{}\n\n{marker}", body(f))}});
-        if let (Some(path), Some(line), true) = (&f.file, f.line, f.in_diff) {
-            payload["inline"] = json!({"path": path, "to": line});
-        }
-        let res = http
-            .post(&endpoint)
-            .basic_auth(&email, Some(&token))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::Invalid(format!(
-                    "Bitbucket: publicação interrompida após {} comentário(s): {e}",
-                    published.len()
-                ))
-            })?;
-        if !res.status().is_success() {
-            return Err(AppError::Invalid(format!(
-                "Bitbucket HTTP {} após {} comentário(s)",
-                res.status(),
-                published.len()
-            )));
-        }
-        let data: Value = res
-            .json()
-            .await
-            .map_err(|e| AppError::Invalid(format!("resposta Bitbucket inválida: {e}")))?;
-        let id = data
-            .get("id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| AppError::Invalid("Bitbucket não devolveu ID do comentário".into()))?
-            .to_string();
-        let url = data
-            .pointer("/links/html/href")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-        conn.execute("INSERT INTO published_findings (run_id, finding_seq, remote_id, remote_url) VALUES (?1,?2,?3,?4)", params![run_id, f.seq, id, url])?;
-        published.push(Published { seq: f.seq, url });
+        conn.execute(
+            "INSERT OR IGNORE INTO published_findings (run_id, finding_seq, remote_id, remote_url) VALUES (?1,?2,?3,?4)",
+            params![run_id, f.seq, remote, url],
+        )?;
     }
-    Ok(published)
+    already.extend(findings.into_iter().map(|f| Published { seq: f.seq, url: url.clone() }));
+    Ok(already)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(conn: &rusqlite::Connection, provider: &str) {
+        conn.execute(
+            "INSERT INTO repositories (id, provider, workspace, slug) VALUES (1, ?1, 'acme', 'app')",
+            [provider],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO pull_requests (id, repository_id, bb_id, title, url, author_uuid, reviewers_json, participants_json,
+               source_branch, dest_branch, source_sha, dest_sha, state, created_on, updated_on, category)
+             VALUES (1, 1, 7, 't', 'u', 'a', '[]', '[]', 'PROJ-1', 'main', 'abc', 'd', 'OPEN', 'x', 'x', 'review_requested');
+             INSERT INTO review_runs (id, pr_id, source_sha, status, run_dir) VALUES ('r1', 1, 'abc', 'completed', '/r');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bitbucket_nao_recebe_publicacao() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "bitbucket");
+        assert_eq!(writable_target(&conn, "r1").unwrap_err().to_string(), "o Crivo não escreve no Bitbucket");
+    }
+
+    #[test]
+    fn github_recebe_publicacao() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "github");
+        let (rr, number, sha) = writable_target(&conn, "r1").unwrap();
+        assert_eq!((rr.label(number), sha.as_str()), ("acme/app#7".to_owned(), "abc"));
+    }
 }

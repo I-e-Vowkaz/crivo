@@ -15,6 +15,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 use super::{STOP, cli_host, install_signals, set_assets_from_exe, sync};
+use crate::hosting::RepoRef;
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
 use crate::fix::{self, CliLock, Owner};
@@ -153,33 +154,32 @@ fn my_open_prs(conn: &Connection, branch: &str, repo: Option<&str>) -> AppResult
         "SELECT p.id, r.slug, p.source_branch, p.bb_id, p.title, p.url, r.provider, r.workspace
          FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
          WHERE p.state = 'OPEN' AND p.category != 'review_requested' AND lower(p.source_branch) = lower(?1)
-           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))
          ORDER BY r.provider, r.workspace, r.slug",
     )?;
-    let rows = stmt.query_map(params![branch, repo], |r| {
-        let slug: String = r.get(1)?;
-        let provider: String = r.get(6)?;
-        let owner: String = r.get(7)?;
-        Ok(MyPr {
+    let rows = stmt.query_map(params![branch], |r| {
+        let rr = RepoRef::from_row(&r.get::<_, String>(6)?, r.get(7)?, r.get(1)?)?;
+        Ok((rr.clone(), MyPr {
             id: r.get(0)?,
-            label: if provider == "github" { format!("{owner}/{slug}#{}", r.get::<_, i64>(3)?) } else { format!("{slug}#{}", r.get::<_, i64>(3)?) },
-            slug,
+            label: rr.label(r.get(3)?),
+            slug: rr.slug,
             branch: r.get(2)?,
             title: r.get(4)?,
             url: r.get(5)?,
-        })
+        }))
     })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let all: Vec<(RepoRef, MyPr)> = rows.collect::<Result<_, _>>()?;
+    Ok(all.into_iter().filter(|(rr, _)| repo.is_none_or(|f| rr.matches(f))).map(|(_, p)| p).collect())
 }
 
 fn others_open_prs_count(conn: &Connection, branch: &str, repo: Option<&str>) -> AppResult<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
-         WHERE p.state = 'OPEN' AND p.category = 'review_requested' AND lower(p.source_branch) = lower(?1)
-           AND (?2 IS NULL OR r.slug = ?2 OR (r.provider = 'github' AND r.workspace || '/' || r.slug = ?2))",
-        params![branch, repo],
-        |r| r.get(0),
-    )?)
+    let mut stmt = conn.prepare(
+        "SELECT r.provider, r.workspace, r.slug FROM pull_requests p JOIN repositories r ON r.id = p.repository_id
+         WHERE p.state = 'OPEN' AND p.category = 'review_requested' AND lower(p.source_branch) = lower(?1)",
+    )?;
+    let repos: Vec<RepoRef> = stmt
+        .query_map(params![branch], |r| RepoRef::from_row(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))?
+        .collect::<Result<_, _>>()?;
+    Ok(repos.iter().filter(|rr| repo.is_none_or(|f| rr.matches(f))).count() as i64)
 }
 
 /// Os `C1, C2…` são por PR: as ações precisam de um PR só.
@@ -827,6 +827,24 @@ mod tests {
         assert!(check_single(&prs[..1], &Action::Commit).is_ok());
         assert_eq!(others_open_prs_count(&conn, "PROJ-1", Some("outro")).unwrap(), 1);
         assert_eq!(others_open_prs_count(&conn, "PROJ-1", Some("back")).unwrap(), 0);
+    }
+
+    #[test]
+    fn repo_do_github_com_mesmo_nome() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_prs(&conn);
+        conn.execute_batch(
+            "INSERT INTO repositories (id, provider, workspace, slug) VALUES (4, 'github', 'acme', 'back');
+             INSERT INTO pull_requests (id, repository_id, bb_id, title, url, author_uuid, reviewers_json, participants_json,
+               source_branch, dest_branch, source_sha, dest_sha, state, created_on, updated_on, category)
+             VALUES (5, 4, 40, 'g', 'u5', 'eu', '[]', '[]', 'PROJ-1', 'main', 's', 'd', 'OPEN', 'x', 'x', 'authored');",
+        )
+        .unwrap();
+        let labels = |repo| my_open_prs(&conn, "PROJ-1", repo).unwrap().into_iter().map(|p| p.label).collect::<Vec<_>>();
+        assert_eq!(labels(None), vec!["back#20", "front#10", "acme/back#40"]);
+        assert_eq!(labels(Some("acme/back")), vec!["acme/back#40"]);
+        assert_eq!(labels(Some("back")), vec!["back#20", "acme/back#40"]);
+        assert!(labels(Some("outro/back")).is_empty());
     }
 
     #[test]
