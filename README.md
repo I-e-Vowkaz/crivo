@@ -14,7 +14,8 @@ App desktop em Tauri 2, com backend em Rust e interface em Vue 3. A interface e 
   3. O Haiku procura complexidade desnecessária, consultas repetidas e testes que falham ou são instáveis, respeitando as convenções do repositório (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules`, `.claude/rules`).
   4. Um juiz (Sonnet) dá nota de 0 a 10 a cada melhoria e descarta as que mudam o comportamento.
   5. O Opus confere todos os bugs válidos e marca cada um como confirmado, severidade ajustada, falso positivo ou evidência insuficiente.
-  6. Opcionalmente, o Haiku testa o PR no navegador pelo Claude in Chrome, só em hosts permitidos e com usuários de desenvolvimento.
+  6. Em PRs do GitHub, o agente `rc-validator` (Sonnet) valida no código os bugs que o Opus não derrubou e as melhorias de nota 7 ou mais, decide o que bloqueia o merge, o que vai como sugestão e o que fica de fora, junta achados com a mesma causa e escreve cada comentário. O painel mostra o pedido de mudanças pronto; você desmarca o que não quiser e envia com um clique (`REQUEST_CHANGES` se houver bloqueante, senão comentário). Nada vai para a PR sem o clique.
+  7. Opcionalmente, o Haiku testa o PR no navegador pelo Claude in Chrome, só em hosts permitidos e com usuários de desenvolvimento.
 - Chat sobre o review, com memória e com acesso de leitura ao projeto do outro lado da task (front ↔ back).
 - Meus PRs: busca os comentários abertos, analisa cada um com o Sonnet (procede, não procede ou resposta) e aplica só as sugestões que você aprovar, num worktree próprio. Commit pelo agente `committer` e push sem force.
 - Minhas branches: o mesmo review e a mesma correção para branches locais, ainda sem PR.

@@ -29,7 +29,7 @@ struct Finding {
 
 /// O PR de um review concluído (repositório, número e commit revisado), se o provedor aceita
 /// escrita. Recusa antes de qualquer chamada à API.
-fn writable_target(conn: &Connection, run_id: &str) -> AppResult<(RepoRef, i64, String)> {
+pub(crate) fn writable_target(conn: &Connection, run_id: &str) -> AppResult<(RepoRef, i64, String)> {
     let (rr, number, sha) = conn
         .query_row(
             "SELECT pvd.provider, pvd.workspace, pvd.slug, p.bb_id, rr.source_sha

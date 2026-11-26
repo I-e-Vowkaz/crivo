@@ -448,7 +448,33 @@ fn report(t: &Target, run: &Value, jira_site: Option<&str>) -> String {
     if discarded > 0 {
         out.push(format!("{discarded} achado(s) descartado(s) pela validação do arquivo:linha ou pelo Opus (estão no app)."));
     }
+    out.extend(rc_section(run, findings));
     out.join("\n\n")
+}
+
+/// Pedido de mudanças do `rc-validator` (só PR do GitHub). O envio é pelo app.
+fn rc_section(run: &Value, findings: &[Value]) -> Vec<String> {
+    match s(run, "rc_status") {
+        "completed" => {}
+        "failed" => return vec!["## Pedido de mudanças\n\nO agente falhou; publique pela seleção manual no app.".into()],
+        _ => return vec![],
+    }
+    let mut items: Vec<&Value> = findings.iter().filter(|f| matches!(s(f, "rc_decision"), "bloqueante" | "sugestao")).collect();
+    items.sort_by_key(|f| (s(f, "rc_decision") != "bloqueante", f["seq"].as_i64()));
+    let blocking = items.iter().filter(|f| s(f, "rc_decision") == "bloqueante").count();
+    let out_count = findings.iter().filter(|f| s(f, "rc_decision") == "fora").count();
+    let mut out = vec![format!(
+        "## Pedido de mudanças ({blocking} bloqueante(s), {} sugestão(ões), {out_count} fora; envie pelo app)",
+        items.len() - blocking
+    )];
+    if !s(run, "rc_summary").is_empty() {
+        out.push(s(run, "rc_summary").to_owned());
+    }
+    for f in items {
+        let label = if s(f, "rc_decision") == "bloqueante" { "BLOQUEANTE" } else { "sugestão" };
+        out.push(format!("### F{} · {label} · `{}:{}`\n\n{}", f["seq"], s(f, "file"), f["line"], s(f, "rc_body")));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -493,6 +519,21 @@ mod tests {
         assert!(r.contains("Card: https://acme.atlassian.net/browse/PROJ-1"));
         // sem site do Jira configurado, sem link do card
         assert!(!report(&t, &run, None).contains("Card:"));
+    }
+
+    #[test]
+    fn pedido_de_mudancas_no_fim_do_relatorio() {
+        let findings = vec![
+            json!({"seq": 1, "rc_decision": "sugestao", "file": "a.php", "line": 3, "rc_body": "renomeie"}),
+            json!({"seq": 2, "rc_decision": "bloqueante", "file": "b.php", "line": 9, "rc_body": "filtre o tenant"}),
+            json!({"seq": 3, "rc_decision": "fora"}),
+        ];
+        let run = json!({"rc_status": "completed", "rc_summary": "Falta o tenant."});
+        let r = rc_section(&run, &findings).join("\n\n");
+        assert!(r.starts_with("## Pedido de mudanças (1 bloqueante(s), 1 sugestão(ões), 1 fora; envie pelo app)\n\nFalta o tenant."), "{r}");
+        assert!(r.find("F2 · BLOQUEANTE · `b.php:9`\n\nfiltre o tenant").unwrap() < r.find("F1 · sugestão").unwrap());
+        assert!(rc_section(&json!({"rc_status": null}), &findings).is_empty());
+        assert!(rc_section(&json!({"rc_status": "failed"}), &findings)[0].contains("falhou"));
     }
 
     #[test]

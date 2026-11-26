@@ -114,6 +114,28 @@ export function pipelineNodes(run: Run): PipeNode[] {
   };
 
   const nodes = [sonnet, validation, haiku, judge, opus];
+  // pedido de mudanças: só em PR do GitHub (nulo quando não se aplica)
+  const r = stageIs(run, "pedido de mudanças") ? "running" : live(run, run.rc_status);
+  if (r) {
+    const count = (d: string) => run.findings.filter((f) => f.rc_decision === d).length;
+    nodes.push({
+      key: "rc",
+      name: "RC",
+      state: r === "running" ? "run" : r === "completed" ? "on" : r === "failed" || r === "interrupted" ? "fail" : "off",
+      detail:
+        r === "running"
+          ? "validando…"
+          : r === "completed"
+            ? `${count("bloqueante")} bloqueante(s), ${count("sugestao")} sugestão(ões)`
+            : r === "failed"
+              ? "falhou: use a seleção manual"
+              : r === "interrupted"
+                ? "interrompido"
+                : r === "not_needed"
+                  ? "nada a pedir"
+                  : "cancelado",
+    });
+  }
   const b = live(run, run.browser_status);
   if (b) {
     const ok = run.browser_tests.filter((t) => t.status === "aprovado").length;

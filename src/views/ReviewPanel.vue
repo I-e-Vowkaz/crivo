@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import DiffView from "./DiffView.vue";
@@ -74,6 +75,42 @@ async function publish(requestChanges: boolean) {
     publishing.value = false;
   }
 }
+// ---- pedido de mudanças (rc-validator) ----
+/** Itens que entram no RC: bloqueantes primeiro. */
+const rcItems = computed(() =>
+  (run.value?.findings ?? [])
+    .filter((f) => (f.rc_decision === "bloqueante" || f.rc_decision === "sugestao") && f.rc_body)
+    .sort((a, b) => (a.rc_decision === b.rc_decision ? a.seq - b.seq : a.rc_decision === "bloqueante" ? -1 : 1)),
+);
+const rcOut = computed(() => (run.value?.findings ?? []).filter((f) => f.rc_decision === "fora"));
+const rcDuplicates = (seq: number) => rcOut.value.filter((f) => f.rc_duplicate_of === seq).map((f) => `F${f.seq}`);
+/** Itens que o revisor tirou antes de enviar. */
+const rcSkip = ref<number[]>([]);
+const rcSelected = computed(() => rcItems.value.filter((f) => !rcSkip.value.includes(f.seq)));
+const rcBlocking = computed(() => rcSelected.value.some((f) => f.rc_decision === "bloqueante"));
+const sendingRc = ref(false);
+
+function toggleRcSkip(seq: number) {
+  rcSkip.value = rcSkip.value.includes(seq) ? rcSkip.value.filter((s) => s !== seq) : [...rcSkip.value, seq];
+}
+
+async function sendRc() {
+  const n = rcSelected.value.length;
+  if (!n) return;
+  const what = rcBlocking.value ? "Pedir mudanças" : "Comentar";
+  if (!window.confirm(`${what} na PR com ${n} comentário(s)?`)) return;
+  sendingRc.value = true;
+  error.value = "";
+  try {
+    await api.sendRequestChanges(props.runId, rcSkip.value);
+    await load();
+  } catch (e) {
+    error.value = errorText(e);
+  } finally {
+    sendingRc.value = false;
+  }
+}
+
 const unlisten: (() => void)[] = [];
 
 async function load() {
@@ -412,6 +449,46 @@ watch(() => props.runId, load);
             <span v-else-if="run.audit_status === 'failed'" class="muted small">— auditoria do Opus falhou</span>
           </h3>
           <p v-if="run.status === 'completed' && !main.length && !run.warning" class="msg ok">Nenhum bug encontrado.</p>
+          <div v-if="pr && run.status === 'completed' && run.rc_status" class="card">
+            <strong>Pedido de mudanças</strong>
+            <template v-if="run.rc_status === 'completed'">
+              <p v-if="run.rc_summary">{{ run.rc_summary }}</p>
+              <p class="muted small">
+                Validado pelo Sonnet: {{ rcItems.filter((f) => f.rc_decision === "bloqueante").length }} bloqueante(s),
+                {{ rcItems.filter((f) => f.rc_decision === "sugestao").length }} sugestão(ões), {{ rcOut.length }} fora. Desmarque o que não quiser enviar.
+              </p>
+              <div v-for="f in rcItems" :key="f.seq" class="rc-item">
+                <label class="small">
+                  <input type="checkbox" :checked="!rcSkip.includes(f.seq)" :disabled="!!run.rc_sent_url" @change="toggleRcSkip(f.seq)" />
+                  <span :class="['badge', { error: f.rc_decision === 'bloqueante' }]">{{ f.rc_decision === "bloqueante" ? "bloqueante" : "sugestão" }}</span>
+                  <a href="#" class="fid" @click.prevent="goFinding(f.seq)">F{{ f.seq }}</a> · <code>{{ f.file }}:{{ f.line }}</code>
+                  <template v-if="f.in_diff === false"> · fora do diff (vai no corpo do review)</template>
+                </label>
+                <pre class="suggestion">{{ f.rc_body }}</pre>
+                <p v-if="rcDuplicates(f.seq).length" class="muted small">Junta {{ rcDuplicates(f.seq).join(", ") }}, com a mesma causa.</p>
+                <p v-if="f.rc_reason" class="muted small"><em>Por quê:</em> {{ f.rc_reason }}</p>
+              </div>
+              <p v-if="!rcItems.length" class="msg ok">O agente não achou nada que justifique pedir mudanças.</p>
+              <details v-if="rcOut.length">
+                <summary class="small">{{ rcOut.length }} achado(s) fora do pedido</summary>
+                <ul>
+                  <li v-for="f in rcOut" :key="f.seq" class="small">
+                    <a href="#" class="fid" @click.prevent="goFinding(f.seq)">F{{ f.seq }}</a> {{ f.title }} —
+                    <em>{{ f.rc_duplicate_of ? `repete o F${f.rc_duplicate_of}` : f.rc_reason }}</em>
+                  </li>
+                </ul>
+              </details>
+              <p v-if="run.rc_sent_url" class="msg ok">
+                Enviado. <a href="#" @click.prevent="openUrl(run.rc_sent_url)">Abrir no GitHub</a>
+              </p>
+              <button v-else-if="rcItems.length" :disabled="sendingRc || !rcSelected.length" @click="sendRc">
+                {{ sendingRc ? "Enviando…" : rcBlocking ? `Pedir mudanças (${rcSelected.length})` : `Comentar (${rcSelected.length})` }}
+              </button>
+            </template>
+            <p v-else-if="run.rc_status === 'not_needed'" class="muted small">Nada a pedir: nenhum achado válido.</p>
+            <p v-else-if="run.rc_status === 'failed'" class="msg warn">O agente do pedido de mudanças falhou; use a seleção manual abaixo.</p>
+            <p v-else class="muted small">O agente não terminou ({{ run.rc_status }}); use a seleção manual abaixo.</p>
+          </div>
           <div v-if="canPublish && main.length" class="card">
             <strong>Publicar achados na PR</strong>
             <p class="muted small">Selecione os achados abaixo. Confira o texto antes de enviar; o Crivo verifica novamente o commit da PR.</p>

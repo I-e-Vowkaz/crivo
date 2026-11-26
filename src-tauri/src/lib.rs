@@ -11,6 +11,7 @@ mod github;
 mod hosting;
 mod proc;
 mod publish;
+mod rc;
 mod review;
 mod secrets;
 mod testenv;
@@ -166,6 +167,7 @@ pub fn run() {
             commands::review_cancel,
             commands::review_get,
             publish::publish_findings,
+            rc::send_request_changes,
             commands::test_apps_get,
             commands::test_app_save,
             commands::checkout_pr,

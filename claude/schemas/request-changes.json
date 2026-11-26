@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "items"],
+  "properties": {
+    "summary": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "decision", "reason", "body"],
+        "properties": {
+          "id": { "type": "string" },
+          "decision": { "type": "string", "enum": ["bloqueante", "sugestao", "fora"] },
+          "duplicate_of": { "type": "string" },
+          "reason": { "type": "string" },
+          "body": { "type": "string" }
+        }
+      }
+    }
+  }
+}
