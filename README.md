@@ -77,3 +77,7 @@ Cada comando tem `--help`. Em `packaging/claude-skill/` há skills do Claude Cod
 ## Custo
 
 Medido em uso real: um review típico custa entre US$ 0,25 e US$ 0,35 (Sonnet), mais cerca de US$ 0,32 quando o Opus entra. O Haiku fica em torno de US$ 0,03. A aba Uso mostra os números das suas execuções.
+
+## Apoie
+
+Se o Crivo te ajuda, considere contribuir via Pix: `8759bf8d-e16f-4646-ab96-8807a3997b0c`
