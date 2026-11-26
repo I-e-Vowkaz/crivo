@@ -39,6 +39,8 @@ npm run tauri build      # gera o .rpm em src-tauri/target/release/bundle/rpm/
 npm run build:deb         # gera o .deb num container Ubuntu 22.04 (Docker ou Podman)
 ```
 
+A cada merge na `main`, o GitHub Actions (`.github/workflows/pacotes.yml`) gera o `.deb` e o `.rpm` no Ubuntu 22.04 e os deixa para baixar na execução, na aba Actions. Também dá para rodar à mão em Actions → Pacotes → Run workflow.
+
 Para desenvolver: `npm run tauri dev`. Testes: `cd src-tauri && cargo test` e `npm run build`.
 
 ## Configurar
