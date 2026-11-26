@@ -11,6 +11,7 @@ use tauri::{Emitter, State};
 use crate::bitbucket::{self, Account, client::Client};
 use crate::db;
 use crate::github;
+use crate::hosting;
 use crate::review;
 use crate::error::{AppError, AppResult};
 use crate::secrets::{self, KeyringStore, SecretKind, SecretStore};
@@ -191,7 +192,7 @@ fn monitored_repos(conn: &Connection) -> AppResult<Vec<String>> {
 
 /// Busca no Bitbucket os PRs abertos em que sou reviewer ou autor, em todos os repos monitorados.
 #[tauri::command]
-pub async fn sync_prs(state: State<'_, AppState>) -> AppResult<bitbucket::sync::SyncResult> {
+pub async fn sync_prs(state: State<'_, AppState>) -> AppResult<hosting::SyncResult> {
     sync_all(&state.db, state.secrets.as_ref()).await
 }
 
@@ -200,16 +201,16 @@ fn lock(db: &Mutex<Connection>) -> AppResult<std::sync::MutexGuard<'_, Connectio
 }
 
 /// O sync em si: usado pela tela e pelo modo sem janela (`--sync`, timer das 10h).
-pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
+pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<hosting::SyncResult> {
     let has_bitbucket = {
         let conn = lock(db)?;
         db::get_setting(&conn, "bitbucket.workspace")?.and_then(|v| v.as_str().map(str::to_owned)).is_some_and(|s| !s.trim().is_empty())
     };
-    let mut result = bitbucket::sync::SyncResult { user: String::new(), repos: Vec::new(), requests: 0 };
+    let mut result = hosting::SyncResult { user: String::new(), repos: Vec::new(), requests: 0 };
     if has_bitbucket {
         match sync_bitbucket(db, store).await {
             Ok(r) => result = r,
-            Err(e) => result.repos.push(bitbucket::sync::RepoSync {
+            Err(e) => result.repos.push(hosting::RepoSync {
                 slug: "Bitbucket".into(), open: 0, error: Some(e.to_string()), fetch_error: None,
             }),
         }
@@ -231,7 +232,7 @@ pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppRes
         let (api, me) = match auth {
             Ok(pair) => pair,
             Err(e) => {
-                result.repos.extend(repos.into_iter().map(|(owner, name)| bitbucket::sync::RepoSync {
+                result.repos.extend(repos.into_iter().map(|(owner, name)| hosting::RepoSync {
                     slug: format!("{owner}/{name}"), open: 0, error: Some(format!("GitHub: {e}")), fetch_error: None,
                 }));
                 return Ok(result);
@@ -262,7 +263,7 @@ pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppRes
             let fetch_error = if clone.join(".git").exists() {
                 review::git::run(&clone, &["fetch", "--prune", "-q", "origin"]).await.err().map(|e| e.to_string())
             } else { Some(format!("clone local não encontrado em {}", clone.display())) };
-            result.repos.push(bitbucket::sync::RepoSync { slug: format!("{owner}/{name}"), open, error, fetch_error });
+            result.repos.push(hosting::RepoSync { slug: format!("{owner}/{name}"), open, error, fetch_error });
         }
         let failed = result.repos.iter().filter_map(|r| r.error.as_ref()).cloned().collect::<Vec<_>>();
         result.requests += api.requests();
@@ -275,7 +276,7 @@ pub async fn sync_all(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppRes
     Ok(result)
 }
 
-async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<bitbucket::sync::SyncResult> {
+async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppResult<hosting::SyncResult> {
     let (email, workspace, repos) = {
         let conn = lock(db)?;
         let (email, workspace) = bitbucket::account_settings(&conn)?;
@@ -312,7 +313,7 @@ async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppR
         } else {
             Some(format!("clone local não encontrado em {}", clone.display()))
         };
-        out.push(bitbucket::sync::RepoSync { slug, open, error, fetch_error });
+        out.push(hosting::RepoSync { slug, open, error, fetch_error });
     }
     let failed: Vec<String> = out.iter().filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.slug))).collect();
     {
@@ -328,7 +329,7 @@ async fn sync_bitbucket(db: &Mutex<Connection>, store: &dyn SecretStore) -> AppR
             ],
         )?;
     }
-    Ok(bitbucket::sync::SyncResult { user: me.display_name, repos: out, requests: client.requests() })
+    Ok(hosting::SyncResult { user: me.display_name, repos: out, requests: client.requests() })
 }
 
 #[derive(Serialize)]

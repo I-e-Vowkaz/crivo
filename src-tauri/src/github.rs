@@ -182,13 +182,10 @@ pub fn configured_repos(raw: Option<Value>) -> AppResult<Vec<(String, String)>> 
     Ok(repos)
 }
 
+
+/// Repasse temporário para `hosting::RepoRef::clone_path` (sai quando os chamadores usarem o `RepoRef`).
 pub fn clone_path(root: &Path, owner: &str, repo: &str) -> std::path::PathBuf {
-    let nested = root.join(owner).join(repo);
-    if nested.join(".git").exists() {
-        nested
-    } else {
-        root.join(repo)
-    }
+    crate::hosting::RepoRef { kind: crate::hosting::Kind::Github, owner: owner.into(), slug: repo.into() }.clone_path(root)
 }
 
 pub fn issue_refs(
@@ -340,7 +337,7 @@ pub async fn open_threads(
     repo: &str,
     number: i64,
     me: &str,
-) -> AppResult<Vec<crate::bitbucket::comments::Thread>> {
+) -> AppResult<Vec<crate::hosting::Thread>> {
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -372,7 +369,7 @@ pub async fn open_threads(
                 let Some(id) = first.get("databaseId").and_then(Value::as_i64) else {
                     continue;
                 };
-                out.push(crate::bitbucket::comments::Thread {
+                out.push(crate::hosting::Thread {
                     id,
                     author: first
                         .pointer("/author/login")
@@ -398,7 +395,7 @@ pub async fn open_threads(
                     replies: comments
                         .iter()
                         .skip(1)
-                        .map(|c| crate::bitbucket::comments::Reply {
+                        .map(|c| crate::hosting::Reply {
                             author: c
                                 .pointer("/author/login")
                                 .and_then(Value::as_str)
@@ -447,7 +444,7 @@ pub async fn open_threads(
             let Some(id) = c.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            out.push(crate::bitbucket::comments::Thread {
+            out.push(crate::hosting::Thread {
                 id: -id,
                 author: c
                     .pointer("/user/login")

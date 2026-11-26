@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::client::Client;
 use crate::error::AppResult;
@@ -70,28 +70,7 @@ struct Links {
     html: Option<super::sync::Href>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Reply {
-    pub author: String,
-    pub body: String,
-    pub created_on: Option<String>,
-}
-
-/// Uma thread de comentário que ainda pede resposta.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct Thread {
-    pub id: i64,
-    pub author: String,
-    pub body: String,
-    /// Comentário em linha: arquivo e linha (do lado novo; do antigo se a linha foi removida).
-    pub path: Option<String>,
-    pub line: Option<i64>,
-    /// O código comentado mudou depois do comentário.
-    pub outdated: bool,
-    pub url: Option<String>,
-    pub created_on: Option<String>,
-    pub replies: Vec<Reply>,
-}
+pub use crate::hosting::{Reply, Thread};
 
 fn name(c: &BbComment) -> String {
     c.user.as_ref().and_then(|u| u.display_name.clone()).unwrap_or_else(|| "?".into())

@@ -105,21 +105,6 @@ pub struct Reviewer {
     pub state: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RepoSync {
-    pub slug: String,
-    pub open: usize,
-    pub error: Option<String>,
-    /// `git fetch --prune` no clone local (traz as branches novas para o Checkout).
-    pub fetch_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SyncResult {
-    pub user: String,
-    pub repos: Vec<RepoSync>,
-    pub requests: u32,
-}
 
 async fn search(client: &Client, ws: &str, slug: &str, q: &str) -> AppResult<Vec<BbPr>> {
     let mut out = Vec::new();
