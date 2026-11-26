@@ -89,13 +89,6 @@ impl Provider {
         }
     }
 
-    pub fn kind(&self) -> Kind {
-        match self {
-            Provider::Bitbucket(_) => Kind::Bitbucket,
-            Provider::Github(_) => Kind::Github,
-        }
-    }
-
     pub fn requests(&self) -> u32 {
         match self {
             Provider::Bitbucket(s) => s.client.requests(),
@@ -190,6 +183,66 @@ impl Provider {
         }
     }
 
+    /// Publica um review com os achados no PR e devolve o ID e o link dele. Só no GitHub: o Crivo
+    /// não escreve no Bitbucket. Se um review meu com o mesmo `marker` já existe (publicação
+    /// repetida depois de uma falha), devolve esse em vez de criar outro.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish(
+        &self,
+        repo: &RepoRef,
+        number: i64,
+        sha: &str,
+        body: &str,
+        marker: &str,
+        inline: &[Value],
+        request_changes: bool,
+    ) -> AppResult<(String, Option<String>)> {
+        let Provider::Github(s) = self else {
+            return Err(AppError::Invalid("o Crivo não escreve no Bitbucket".into()));
+        };
+        let (owner, name) = (&repo.owner, &repo.slug);
+        let current: Value = s.api.get(&format!("/repos/{owner}/{name}/pulls/{number}")).await?;
+        if current.get("state").and_then(Value::as_str) != Some("open") {
+            return Err(AppError::Invalid("a PR já não está aberta".into()));
+        }
+        if current.pointer("/head/sha").and_then(Value::as_str) != Some(sha) {
+            return Err(AppError::Invalid("a PR recebeu novos commits; revise novamente antes de publicar".into()));
+        }
+        let me: github::User = s.api.get("/user").await?;
+        let mut prior: Option<Value> = None;
+        for page in 1..=100 {
+            let reviews: Vec<Value> =
+                s.api.get(&format!("/repos/{owner}/{name}/pulls/{number}/reviews?per_page=100&page={page}")).await?;
+            let last = reviews.len() < 100;
+            prior = reviews.into_iter().find(|r| {
+                r.pointer("/user/login").and_then(Value::as_str) == Some(me.login.as_str())
+                    && r.get("body").and_then(Value::as_str).is_some_and(|b| b.contains(marker))
+            });
+            if prior.is_some() || last {
+                break;
+            }
+        }
+        let response: Value = match prior {
+            Some(prior) => prior,
+            None => {
+                let event = if request_changes { "REQUEST_CHANGES" } else { "COMMENT" };
+                s.api
+                    .request(
+                        reqwest::Method::POST,
+                        &format!("/repos/{owner}/{name}/pulls/{number}/reviews"),
+                        Some(&json!({"commit_id": sha, "event": event, "body": body, "comments": inline})),
+                    )
+                    .await?
+            }
+        };
+        let remote = response
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| AppError::Invalid("GitHub não devolveu ID do review".into()))?
+            .to_string();
+        Ok((remote, response.get("html_url").and_then(Value::as_str).map(str::to_owned)))
+    }
+
     /// Texto a acrescentar ao contexto do review: as issues citadas no PR (GitHub). Os avisos vão
     /// para o log de quem chamou.
     pub async fn extra_context(&self, repo: &RepoRef, title: &str, body: &str, log: &(dyn Fn(&str) + Sync)) -> String {
@@ -265,6 +318,17 @@ mod tests {
             .unwrap();
         assert_eq!((cat.as_str(), status.as_str()), ("authored", "completed"));
         assert_eq!(p.requests(), 3);
+    }
+
+    #[tokio::test]
+    async fn bitbucket_recusa_publicar_sem_chamar_a_api() {
+        let srv = start(vec![]);
+        let client = crate::bitbucket::client::Client::with_base(&srv.base, "e@x", "tok-secreto-123456").unwrap();
+        let p = Provider::Bitbucket(BitbucketSession { client, workspace: "ws".into() });
+        let rr = RepoRef::new("bitbucket", "ws", "r").unwrap();
+        let err = p.publish(&rr, 1, "abc", "corpo", "<!-- m -->", &[], false).await.unwrap_err();
+        assert_eq!(err.to_string(), "o Crivo não escreve no Bitbucket");
+        assert_eq!(p.requests(), 0);
     }
 
     #[tokio::test]
