@@ -4,6 +4,9 @@
 //! rótulo, filtro da CLI, refs do git). Os chamadores não comparam o texto do provedor: perguntam
 //! a estes tipos.
 
+mod provider;
+pub use provider::Provider;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,14 @@ impl Kind {
         match self {
             Kind::Bitbucket => "bitbucket",
             Kind::Github => "github",
+        }
+    }
+
+    /// Nome para mensagens ("Bitbucket", "GitHub").
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Bitbucket => "Bitbucket",
+            Kind::Github => "GitHub",
         }
     }
 

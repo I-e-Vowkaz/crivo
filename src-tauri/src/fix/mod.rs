@@ -28,12 +28,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::Emitter;
 
-use crate::bitbucket::{self, client::Client, comments};
+use crate::bitbucket::comments;
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
 use crate::review::claude::{self, RunCtl, Session, Spec, Status};
 use crate::review::{self, Host, Running, git};
-use crate::secrets::SecretKind;
 use apply::Edit;
 
 const ANALYZE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -822,23 +821,6 @@ fn check(ctl: &RunCtl) -> AppResult<()> {
     if ctl.is_cancelled() { Err(AppError::Invalid("cancelado".into())) } else { Ok(()) }
 }
 
-async fn client(host: &Host) -> AppResult<(Client, String, String)> {
-    let st = host.state();
-    let (email, ws, me) = {
-        let conn = st.db.lock().map_err(|_| db_err())?;
-        let (email, ws) = bitbucket::account_settings(&conn)?;
-        let me = crate::db::get_setting(&conn, "bitbucket.me")?
-            .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned))
-            .ok_or_else(|| AppError::Invalid("clique em Atualizar na lista antes (o app ainda não sabe quem é você)".into()))?;
-        (email, ws, me)
-    };
-    let token = st
-        .secrets
-        .get(&SecretKind::Bitbucket.account())?
-        .ok_or_else(|| AppError::Invalid("salve o token do Bitbucket nas Configurações".into()))?;
-    Ok((Client::new(&email, &token)?, ws, me))
-}
-
 /// PR: comentários do Bitbucket → worktree na ponta da origin → itens na fila.
 /// PR: worktree na ponta da origin e os comentários abertos como 'new' (sem análise: o usuário
 /// escolhe quais o Claude analisa).
@@ -860,20 +842,12 @@ async fn prepare_pr(host: &Host, fix_id: &str, t: &Target, repo: &Path, ctl: Arc
 /// Threads abertas do PR que ainda não estão na correção → itens 'new'. Devolve quantas entraram.
 async fn add_threads(host: &Host, fix_id: &str, t: &Target, ctl: &RunCtl) -> AppResult<usize> {
     set_stage(host, fix_id, t, "buscando os comentários da PR");
-    let threads = if let Some(rr) = t.repo.as_ref().filter(|r| r.kind == crate::hosting::Kind::Github) {
-        let (mode, me) = with_db(host, |c| {
-            let mode = crate::db::get_setting(c, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into());
-            let me = crate::db::get_setting(c, "github.me")?.and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_owned))
-                .ok_or_else(|| AppError::Invalid("atualize a lista de PRs do GitHub primeiro".into()))?;
-            Ok((mode, me))
-        })?;
-        let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
-        let api = crate::github::Api::new(token)?;
-        crate::github::open_threads(&api, &rr.owner, &rr.slug, t.bb_id, &me).await?
-    } else {
-        let (client, ws, me) = client(host).await?;
-        comments::open_threads(&client, &ws, &t.slug, t.bb_id, &me).await?
-    };
+    let rr = t.repo.as_ref().ok_or_else(|| AppError::Invalid("correção de PR sem repositório".into()))?;
+    let me = with_db(host, |c| crate::hosting::me(c, rr.kind))?.ok_or_else(|| {
+        AppError::Invalid("clique em Atualizar na lista antes (o app ainda não sabe quem é você)".into())
+    })?;
+    let provider = crate::hosting::Provider::connect(rr.kind, &host.state().db, host.state().secrets.as_ref()).await?;
+    let threads = provider.open_threads(rr, t.bb_id, &me).await?;
     check(ctl)?;
     with_db(host, |c| {
         let mut added = 0;
@@ -1753,14 +1727,9 @@ async fn commit_and_finish(
     check(&ctl)?;
     if t.kind == "pr" {
         set_stage(host, fix_id, t, &format!("push para {}", t.branch));
-        let pushed = if t.repo.as_ref().is_some_and(|r| r.kind == crate::hosting::Kind::Github) {
-            let mode = with_db(host, |c| Ok(crate::db::get_setting(c, "github.auth_mode")?
-                .and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())))?;
-            let token = crate::github::token(&mode, host.state().secrets.as_ref()).await?;
-            crate::github::push(&wt, &t.source_repo, &t.branch, &token).await
-        } else {
-            git::run(&wt, &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)]).await.map(|_| ())
-        };
+        let rr = t.repo.as_ref().ok_or_else(|| AppError::Invalid("correção de PR sem repositório".into()))?;
+        let provider = crate::hosting::Provider::connect(rr.kind, &host.state().db, host.state().secrets.as_ref()).await?;
+        let pushed = provider.push(&wt, &t.source_repo, &t.branch).await;
         pushed.map_err(|e| {
             AppError::Invalid(format!(
                 "o push foi recusado; o commit {short} continua no worktree e o botão tenta de novo. \

@@ -813,22 +813,11 @@ async fn pipeline(ctx: &Ctx, pr: &PrForReview, repo: &Path, wt: &Path, key: Opti
             if pr.description.trim().is_empty() { "(sem descrição)" } else { pr.description.as_str() }
         )
     };
-    if let Some(rr) = pr.repo.as_ref().filter(|r| r.kind == crate::hosting::Kind::Github) {
-        let mode = {
-            let conn = ctx.state().db.lock().map_err(|_| AppError::Invalid("banco indisponível".into()))?;
-            crate::db::get_setting(&conn, "github.auth_mode")?.and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "gh".into())
-        };
-        let token = crate::github::token(&mode, ctx.state().secrets.as_ref()).await?;
-        let api = crate::github::Api::new(token)?;
-        for (owner, repo_name, number) in crate::github::issue_refs(&format!("{} {}", pr.title, pr.description), &rr.owner, &rr.slug) {
-            let issue: serde_json::Value = match api.get(&format!("/repos/{owner}/{repo_name}/issues/{number}")).await {
-                Ok(issue) => issue,
-                Err(e) => { ctx.log(&format!("AVISO: não consegui ler a issue {owner}/{repo_name}#{number}: {e}")); continue; }
-            };
-            if issue.get("pull_request").is_some() { continue; }
-            card_text.push_str(&format!("\n## GitHub Issue {owner}/{repo_name}#{number}\n\n{}\n\n{}\n",
-                issue.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
-                issue.get("body").and_then(serde_json::Value::as_str).unwrap_or("")));
+    // contexto que só o provedor tem (as issues citadas no PR do GitHub); sem ele, o review segue
+    if let Some(rr) = &pr.repo {
+        match crate::hosting::Provider::connect(rr.kind, &ctx.state().db, ctx.state().secrets.as_ref()).await {
+            Ok(p) => card_text.push_str(&p.extra_context(rr, &pr.title, &pr.description, &|l| ctx.log(l)).await),
+            Err(e) => ctx.log(&format!("AVISO: sem o contexto extra do {}: {e}", rr.kind.name())),
         }
     }
     std::fs::write(&card_path, card_text)?;

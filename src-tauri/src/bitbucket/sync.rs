@@ -257,10 +257,10 @@ mod tests {
 
     fn pr_json(id: i64, author: &str, sha: &str, extra: &str) -> String {
         format!(
-            r#"{{"id":{id},"title":"BID-{id}","state":"OPEN","created_on":"2026-11-01T00:00:00Z",
+            r#"{{"id":{id},"title":"PROJ-{id}","state":"OPEN","created_on":"2026-11-01T00:00:00Z",
             "updated_on":"2026-11-02T00:00:00Z","links":{{"html":{{"href":"https://bb/{id}"}}}},
             "author":{{"uuid":"{author}","display_name":"A"}},
-            "source":{{"branch":{{"name":"BID-{id}"}},"commit":{{"hash":"{sha}"}},"repository":{{"full_name":"ws/r"}}}},
+            "source":{{"branch":{{"name":"PROJ-{id}"}},"commit":{{"hash":"{sha}"}},"repository":{{"full_name":"ws/r"}}}},
             "destination":{{"branch":{{"name":"dev"}},"commit":{{"hash":"d1"}}}}{extra}}}"#
         )
     }

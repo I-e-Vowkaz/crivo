@@ -183,11 +183,6 @@ pub fn configured_repos(raw: Option<Value>) -> AppResult<Vec<(String, String)>> 
 }
 
 
-/// Repasse temporário para `hosting::RepoRef::clone_path` (sai quando os chamadores usarem o `RepoRef`).
-pub fn clone_path(root: &Path, owner: &str, repo: &str) -> std::path::PathBuf {
-    crate::hosting::RepoRef { kind: crate::hosting::Kind::Github, owner: owner.into(), slug: repo.into() }.clone_path(root)
-}
-
 pub fn issue_refs(
     text: &str,
     default_owner: &str,
